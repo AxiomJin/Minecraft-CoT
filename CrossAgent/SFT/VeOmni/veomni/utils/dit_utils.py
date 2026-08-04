@@ -27,7 +27,13 @@ if TYPE_CHECKING:
 
 from diffusers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFETENSORS_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 from torch import distributed as dist
-from transformers.utils.import_utils import is_safetensors_available
+try:  # transformers>=5.0 removed `is_safetensors_available` (safetensors is now a hard dependency)
+    from transformers.utils.import_utils import is_safetensors_available
+except ImportError:
+
+    def is_safetensors_available() -> bool:
+        return True
+
 
 from ..models.module_utils import _save_state_dict
 from . import logging

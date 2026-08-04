@@ -18,8 +18,16 @@
 from abc import ABC
 
 import torch
-from transformers import AutoModel, AutoModelForCausalLM, AutoModelForVision2Seq, PreTrainedModel
-from transformers.modeling_utils import no_init_weights
+from transformers import AutoModel, AutoModelForCausalLM, PreTrainedModel
+try:  # transformers>=5.0 moved `no_init_weights` to `transformers.initialization`
+    from transformers.initialization import no_init_weights
+except ImportError:
+    from transformers.modeling_utils import no_init_weights
+
+try:  # transformers>=5.0 removed `AutoModelForVision2Seq` in favor of `AutoModelForImageTextToText`
+    from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
+except ImportError:
+    from transformers import AutoModelForVision2Seq
 
 from ..utils import logging
 from ..utils.import_utils import is_torch_npu_available, is_vescale_available

@@ -6,7 +6,16 @@ from verl.utils.model import compute_position_id_with_mask
 import verl.utils.torch_functional as verl_F
 from transformers import PreTrainedTokenizer
 import uuid
-from verl.models.transformers.qwen2_vl import get_rope_index
+from verl.models.transformers.qwen2_vl import get_rope_index as get_rope_index_qwen2_vl
+from verl.models.transformers.qwen3_vl import get_rope_index as get_rope_index_qwen3_vl
+
+
+def get_rope_index(processor, *args, **kwargs):
+    """Dispatch to the Qwen2-VL/2.5-VL or Qwen3-VL `get_rope_index` implementation
+    depending on the processor's class (they use different M-RoPE layouts)."""
+    if processor.__class__.__name__ == "Qwen3VLProcessor":
+        return get_rope_index_qwen3_vl(processor, *args, **kwargs)
+    return get_rope_index_qwen2_vl(processor, *args, **kwargs)
 from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict, torch_to_numpy, filter_group_data
 from agent_system.environments import EnvironmentManagerBase
 from typing import List, Dict

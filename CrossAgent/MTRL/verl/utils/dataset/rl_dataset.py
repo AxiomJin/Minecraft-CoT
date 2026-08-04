@@ -240,7 +240,37 @@ class RLHFDataset(Dataset):
             truncation=self.truncation,
         )
 
-        if self.processor is not None and self.processor.image_processor.__class__.__name__ == "Qwen2VLImageProcessor":
+        if self.processor is not None and "mm_token_type_ids" in model_inputs:
+            # Qwen3.5 family (shares `Qwen3VLProcessor`, but its output additionally contains
+            # `mm_token_type_ids` -- that's how we tell it apart from a plain Qwen3-VL checkpoint
+            # using the same processor class). Unlike Qwen2-VL/Qwen3-VL, we deliberately do NOT
+            # precompute M-RoPE `position_ids` here: `mm_token_type_ids` is already captured
+            # verbatim into `row_dict["multi_modal_inputs"]` above, and
+            # `Qwen3_5ForConditionalGeneration`/`forward_for_ppo` will compute the correct 3D
+            # position ids internally (via `compute_3d_position_ids`) as long as `position_ids`
+            # passed to the model at forward time is `None`. This placeholder is only so that
+            # `position_ids` has the same (1, 3, seq_len) shape as the other multimodal branches
+            # for batching/collation purposes -- it must NOT be fed to the model as-is.
+            position_ids = [torch.arange(len(input_ids[0])).unsqueeze(0).expand(3, -1)]  # (1, 3, seq_len), placeholder only
+
+        elif self.processor is not None and self.processor.__class__.__name__ == "Qwen3VLProcessor":
+            from verl.models.transformers.qwen3_vl import get_rope_index
+
+            position_ids = [
+                get_rope_index(
+                    self.processor,
+                    input_ids=input_ids[0],
+                    image_grid_thw=model_inputs.get("image_grid_thw"),
+                    video_grid_thw=model_inputs.get("video_grid_thw"),
+                    second_per_grid_ts=model_inputs.get("second_per_grid_ts"),
+                    attention_mask=attention_mask[0],
+                )
+            ]  # (1, 3, seq_len)
+
+        elif self.processor is not None and self.processor.image_processor.__class__.__name__ in (
+            "Qwen2VLImageProcessor",
+            "Qwen2VLImageProcessorFast",
+        ):
             from verl.models.transformers.qwen2_vl import get_rope_index
 
             position_ids = [

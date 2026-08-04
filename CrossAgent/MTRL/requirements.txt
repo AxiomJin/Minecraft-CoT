@@ -16,8 +16,12 @@ pre-commit
 ray[default]
 tensordict<=0.6.2
 torchdata
-transformers==4.51.1
-# vllm==0.8.4
+transformers==5.14.1
+# vllm==0.17.0
+# Qwen3.5's Gated-DeltaNet linear-attention layers fall back to a slow pure-torch
+# implementation without these two (functionally correct either way, just much slower):
+causal-conv1d>=1.4.0
+flash-linear-attention
 wandb
 packaging>=20.0
 uvicorn

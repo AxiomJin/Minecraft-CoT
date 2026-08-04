@@ -17,7 +17,11 @@ from typing import TYPE_CHECKING, Any, Dict, Literal, Optional
 
 import torch
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer, PreTrainedModel
-from transformers.modeling_utils import no_init_weights
+
+try:  # transformers>=5.0 moved `no_init_weights` to `transformers.initialization`
+    from transformers.initialization import no_init_weights
+except ImportError:
+    from transformers.modeling_utils import no_init_weights
 
 from ..auto import build_foundation_model, build_processor
 from ..module_utils import init_empty_weights, load_model_weights

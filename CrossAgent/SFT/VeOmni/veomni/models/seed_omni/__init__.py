@@ -13,7 +13,12 @@
 # limitations under the License.
 
 
-from transformers import AutoConfig, AutoModelForVision2Seq, AutoProcessor
+from transformers import AutoConfig, AutoProcessor
+
+try:  # transformers>=5.0 removed `AutoModelForVision2Seq` in favor of `AutoModelForImageTextToText`
+    from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
+except ImportError:
+    from transformers import AutoModelForVision2Seq
 
 from .auto import SeedOmniConfig, SeedOmniModel, SeedOmniProcessor, build_omni_model, build_omni_processor
 from .decoder import movqgan

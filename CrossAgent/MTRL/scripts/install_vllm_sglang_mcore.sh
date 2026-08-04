@@ -7,12 +7,21 @@ export MAX_JOBS=32
 
 echo "1. install inference frameworks and pytorch they need"
 if [ $USE_SGLANG -eq 1 ]; then
-    pip install "sglang[all]==0.4.6.post1" --no-cache-dir --find-links https://flashinfer.ai/whl/cu124/torch2.6/flashinfer-python && pip install torch-memory-saver --no-cache-dir
+    # NOTE: Qwen3.5 support landed in SGLang shortly after the model's Feb 2026 release; if you
+    # need Qwen3.5 rollout via SGLang specifically, verify this pin (or a newer release) actually
+    # includes it -- vLLM (below) is the better-verified path (Qwen3.5 support confirmed in v0.17.0).
+    pip install "sglang[all]==0.5.6" --no-cache-dir --find-links https://flashinfer.ai/whl/cu124/torch2.6/flashinfer-python && pip install torch-memory-saver --no-cache-dir
 fi
-pip install --no-cache-dir "vllm==0.8.5.post1" "torch==2.6.0" "torchvision==0.21.0" "torchaudio==2.6.0" "tensordict==0.6.2" torchdata
+# vllm==0.17.0: confirmed to include full Qwen3.5 support (hybrid Gated-DeltaNet/full-attention).
+# NOTE: intentionally NOT pinning torch/torchvision/torchaudio versions here (unlike the previous
+# vllm==0.8.5.post1 pin, which needed torch==2.6.0) -- by vllm 0.17.0 the required torch version has
+# almost certainly moved past 2.6.0, and we didn't verify the exact new pairing. Let vllm's own
+# dependency resolution pull in a compatible torch; verify the resulting torch/CUDA build matches
+# your cluster's driver before relying on this in production.
+pip install --no-cache-dir "vllm==0.17.0" "tensordict==0.6.2" torchdata
 
 echo "2. install basic packages"
-pip install "transformers[hf_xet]>=4.51.0" accelerate datasets peft hf-transfer \
+pip install "transformers[hf_xet]==5.14.1" accelerate datasets peft hf-transfer \
     "numpy<2.0.0" "pyarrow>=15.0.0" pandas \
     ray[default] codetiming hydra-core pylatexenc qwen-vl-utils wandb dill pybind11 liger-kernel mathruler \
     pytest py-spy pyext pre-commit ruff

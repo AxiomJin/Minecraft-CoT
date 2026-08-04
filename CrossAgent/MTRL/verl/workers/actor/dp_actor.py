@@ -90,7 +90,23 @@ class DataParallelPPOActor(BasePPOActor):
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
             entropy = None
-            if position_ids.dim() == 3:  # qwen2vl mrope
+            # Qwen3.5: `position_ids` in the batch is only a shape-compatible placeholder (see
+            # `rl_dataset.py`); the model computes correct M-RoPE position ids internally from
+            # `mm_token_type_ids` (already included in `multi_modal_inputs` above) as long as
+            # `position_ids=None` is actually passed to `forward`. Its Gated-DeltaNet linear-attention
+            # layers also don't support the `use_remove_padding` (varlen packing) path used below,
+            # since packing sequences together without per-sequence state resets would corrupt the
+            # linear-attention recurrence -- so we require `use_remove_padding=False` for this model.
+            is_qwen3_5 = "mm_token_type_ids" in multi_modal_inputs
+            if is_qwen3_5:
+                assert not self.use_remove_padding, (
+                    "use_remove_padding (varlen/rmpad packing) is not supported for Qwen3.5 "
+                    "(Gated-DeltaNet linear-attention layers require each sequence's recurrent "
+                    "state to be reset at its own boundary, which the rmpad code path doesn't do); "
+                    "set actor.use_remove_padding=False for this model family."
+                )
+                position_ids = None
+            elif position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
 
             if self.use_remove_padding:

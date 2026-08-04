@@ -38,6 +38,7 @@ try:
     _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
 except ImportError:
     flash_attn_varlen_func = None
+    _flash_supports_window_size = False
 
 
 def get_rope_index(

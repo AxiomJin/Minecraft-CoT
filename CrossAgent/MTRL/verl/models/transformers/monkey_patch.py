@@ -211,6 +211,52 @@ def apply_monkey_patch(
 
         return
 
+    elif model.config.model_type == "qwen3_vl":
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+            Qwen3VLForConditionalGeneration,
+            Qwen3VLTextAttention,
+        )
+
+        # Qwen3-VL has no dedicated `*FlashAttention2` subclass (attention implementation is
+        # resolved dynamically via `ALL_ATTENTION_FUNCTIONS`), so we replace `forward` directly.
+        if use_remove_padding or ulysses_sp_size > 1:
+            from verl.models.transformers.qwen3_vl import ulysses_flash_attn_forward
+
+            Qwen3VLTextAttention.forward = ulysses_flash_attn_forward
+            print("Monkey patch Qwen3VLTextAttention.forward in Qwen3VL")
+
+        if use_fused_kernels:
+            from verl.models.transformers.qwen3_vl import forward_for_ppo
+
+            Qwen3VLForConditionalGeneration.forward = forward_for_ppo
+
+        return
+
+    elif model.config.model_type in ("qwen3_5", "qwen3_5_moe"):
+        # Qwen3.5's decoder layers alternate between full attention and Gated-DeltaNet linear
+        # attention (`config.text_config.layer_types`). Splitting the sequence dim across GPUs
+        # (Ulysses SP) would break the linear-attention layers' causal recurrence, so -- unlike
+        # every other branch in this function -- Qwen3.5 intentionally does NOT support
+        # `ulysses_sp_size > 1`. Only the PPO log_probs/entropy fused-head patch is applied; use
+        # plain FSDP sharding (no sequence parallelism) for RL training with this model family.
+        if ulysses_sp_size > 1:
+            raise NotImplementedError(
+                "Ulysses sequence parallelism (ulysses_sp_size > 1) is not supported for Qwen3.5 "
+                "(model_type='qwen3_5'/'qwen3_5_moe'): its Gated-DeltaNet linear-attention layers "
+                "have a sequential dependency along the time axis that plain sequence-splitting "
+                "breaks. Use ulysses_sp_size=1 (plain FSDP sharding) for this model family."
+            )
+
+        if use_fused_kernels:
+            from transformers import Qwen3_5ForConditionalGeneration
+
+            from verl.models.transformers.qwen3_5 import forward_for_ppo
+
+            Qwen3_5ForConditionalGeneration.forward = forward_for_ppo
+            print("Monkey patch Qwen3_5ForConditionalGeneration.forward (no Ulysses SP support)")
+
+        return
+
     elif model.config.model_type == "kimi_vl":
         if use_remove_padding or ulysses_sp_size > 1:
             # TODO: Changes need to be made when transformers are adapted.
