@@ -1,0 +1,17 @@
+# transformers>=4.57 / trl>=0.20 required: Qwen3-VL("qwen3_vl") and Qwen3.5
+# ("qwen3_5") are only registered in transformers builds >= 4.57.0.dev0, and TRL's
+# SFTConfig renamed max_seq_length -> max_length around the same time. Older
+# pinned minimums here would silently resolve to versions that can't load
+# Qwen3-VL/Qwen3.5 configs at all, or crash on SFTConfig(max_seq_length=...).
+torch>=2.4.0
+transformers>=4.57.0
+trl>=0.20.0
+datasets>=3.0.0
+accelerate>=1.0.0
+deepspeed>=0.15.0
+flash-attn>=2.6.0
+wandb>=0.18.0
+Pillow>=10.0.0
+pyarrow>=17.0.0
+s3fs>=2024.0.0
+boto3>=1.35.0
