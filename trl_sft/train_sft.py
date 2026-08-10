@@ -26,6 +26,21 @@ Usage:
         --data_path s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp/mc-vqa-241102.jsonl \
         --output_dir ./output
 
+    # Stage I (JARVIS-VLA "Minecraft world knowledge" text-only post-training): rows
+    # are plain system+user+assistant text QA with no images at all (e.g.
+    # minecraft-vlp/mc-qa-*.jsonl, label=["qa","wiki","self-instruct"]). --text_only
+    # makes samples carry no "images" key (so SFTTrainer uses its plain-text collator,
+    # not the vision one) and --freeze_vision_tower keeps the ViT+adapter frozen while
+    # only the LLM backbone is updated, matching the paper's Stage I recipe:
+    torchrun --nproc_per_node=$NPROC train_sft.py \
+        --model_path s3://arcwm-code-us-west-2/axiom/model/Qwen2-VL-7B-Instruct \
+        --data_path s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp/mc-qa-250312.jsonl \
+        --text_only \
+        --freeze_vision_tower \
+        --learning_rate 5e-6 \
+        --max_seq_length 3584 \
+        --output_dir ./output
+
 NOTE on VLM + TRL:
   - All target models (Qwen2-VL / Qwen2.5-VL / Qwen3-VL / Qwen3.5-VL) are vision-language
     models. TRL's `SFTTrainer` picks the vision-language data collator
@@ -280,6 +295,54 @@ def build_messages_qa(
     return _split_prompt_completion_with_images(conversations, image_bytes_list)
 
 
+def build_messages_text_only(conversations: list) -> Tuple[Optional[List[Dict]], Optional[List[Dict]]]:
+    """
+    Convert one pure-text row (e.g. `minecraft-vlp/mc-qa-*.jsonl`'s
+    `label=["qa","wiki","self-instruct"]` rows: a leading `system` turn + a `user`
+    question + an `assistant` answer, `image=[]`) into TRL prompt/completion format,
+    for JARVIS-VLA's Stage I ("Minecraft world knowledge" text-only post-training --
+    see `--text_only`/`--freeze_vision_tower`).
+
+    Unlike `build_messages`/`build_messages_qa`, this does NOT strip a leading
+    non-"user" turn: that stripping exists in those two to drop a stray artifact turn
+    seen in trajectory/VQA preprocessing, but here a leading turn is normally a
+    legitimate system prompt ("You are a helpful assistant...") that must be preserved
+    inside `prompt`, not discarded.
+
+    Returns `(prompt, completion)` -- no `images` list, since this data format never
+    has any (see `_row_to_trl_sample`/`build_minecraft_dataset` for why the caller must
+    omit the "images" key entirely from the resulting sample dict rather than passing
+    an empty list, so `SFTTrainer` picks its plain-text collator).
+
+    Any `{"type": "image"}` placeholder encountered is unexpected for this data format
+    and gets replaced with a "[image]" text stand-in (with a warning) rather than
+    silently producing an inconsistent sample -- if you see that warning, the file
+    you're pointing --text_only at probably isn't actually text-only.
+    """
+    if not conversations or len(conversations) < 2:
+        return None, None
+    if conversations[-1]["role"] != "assistant":
+        return None, None
+
+    messages = []
+    for conv in conversations:
+        content_list = []
+        for item in conv["content"]:
+            if item.get("type") == "text":
+                content_list.append({"type": "text", "text": item.get("text", "")})
+            elif item.get("type") == "image":
+                logger.warning(
+                    "build_messages_text_only: found an image placeholder in a "
+                    "--text_only row; replacing with a '[image]' text stand-in. This "
+                    "data file may not actually be text-only -- consider --text_only=False."
+                )
+                content_list.append({"type": "text", "text": "[image]"})
+        messages.append({"role": conv["role"], "content": content_list})
+
+    prompt, completion = messages[:-1], [messages[-1]]
+    return prompt, completion
+
+
 def _row_to_trl_sample(
     sample: Dict,
     idx: int,
@@ -287,6 +350,7 @@ def _row_to_trl_sample(
     seed: int,
     data_format: str,
     image_root: Optional[str],
+    text_only: bool = False,
 ) -> Dict:
     """
     Map ONE raw dataset row (parquet trajectory step OR jsonl QA session, per
@@ -313,11 +377,26 @@ def _row_to_trl_sample(
     effect. For `data_format == "jsonl"` (`minecraft-vlp`-style flat QA rows,
     `build_messages_qa`) there is no history sampling, so no RNG is needed.
 
+    If `text_only=True` (Stage I, see `--text_only`), this bypasses `build_messages`/
+    `build_messages_qa` entirely in favor of `build_messages_text_only`, and the
+    returned dict has NO "images" key at all -- not even an empty list. That distinction
+    matters just as much as the `datasets`-type one above: `SFTTrainer` picks its
+    vision-language collator purely based on whether an "images"/"image" column is
+    *present* on the dataset (regardless of whether it's populated), so omitting the
+    key entirely is what makes Stage I run as ordinary text-only LM fine-tuning instead
+    of (incorrectly) going through the vision collator with empty image lists.
+
     Invalid rows are flagged via `"_keep": False` instead of being dropped here (a
     `.map()` function must return exactly one output row per input row); the caller
     chains `.filter(lambda x: x["_keep"])` afterwards to actually drop them.
     """
     sample_id = sample.get("id", idx)
+    if text_only:
+        prompt, completion = build_messages_text_only(conversations=sample["conversations"])
+        if prompt is None:
+            return {"prompt": [], "completion": [], "_keep": False}
+        return {"prompt": prompt, "completion": completion, "_keep": True}
+
     if data_format == "jsonl":
         prompt, completion, images = build_messages_qa(
             conversations=sample["conversations"],
@@ -362,6 +441,7 @@ def build_minecraft_dataset(
     seed: int = 42,
     data_format: str = "auto",
     image_root: Optional[str] = None,
+    text_only: bool = False,
 ):
     """
     Build the Minecraft SFT dataset as a genuine `datasets.Dataset` (`streaming=False`)
@@ -385,6 +465,18 @@ def build_minecraft_dataset(
         `build_messages_qa` loads those bytes on-the-fly via `fsspec` (works for both
         local paths and `s3://` URIs, the latter via the `s3fs` dependency) and keeps
         the whole conversation (no history sampling -- these rows are already short).
+
+    `text_only=True` (Stage I): for pure-text rows with no images at all -- e.g.
+    `minecraft-vlp/mc-qa-*.jsonl`'s `label=["qa","wiki","self-instruct"]` rows, a
+    `system` + `user` + `assistant` text QA turn with `image=[]` -- routes every row
+    through `build_messages_text_only` instead of `build_messages`/`build_messages_qa`,
+    and the resulting samples carry NO "images" key at all (see `_row_to_trl_sample`).
+    This is what JARVIS-VLA calls Stage I ("Minecraft world knowledge" text-only
+    post-training); combine with `freeze_vision_tower(model)` beforehand to also match
+    the paper's "ViT + adapter frozen, only LLM trained" recipe for this stage. Using
+    `text_only=True` together with `data_format="parquet"` is unusual (parquet rows are
+    trajectories with real images) and logs a warning, but works: any `image_bytes` on
+    those rows is simply ignored.
 
     IMPORTANT: this returns the result of chaining `.map()` / `.filter()` /
     `.remove_columns()` directly on `datasets.load_dataset(...)`'s return value -- NOT a
@@ -412,6 +504,13 @@ def build_minecraft_dataset(
         data_format = _detect_data_format(data_path)
     if data_format not in ("parquet", "jsonl"):
         raise ValueError(f"Unknown data_format: {data_format!r} (expected 'parquet', 'jsonl', or 'auto')")
+    if text_only and data_format == "parquet":
+        logger.warning(
+            "--text_only was set together with a parquet (trajectory) data_format; "
+            "this is unusual -- --text_only is designed for Stage I text-QA jsonl rows "
+            "(e.g. minecraft-vlp/mc-qa-*.jsonl). Any image_bytes on these rows will be "
+            "ignored."
+        )
     if data_format == "jsonl" and image_root is None:
         image_root = _default_image_root(data_path)
 
@@ -437,12 +536,83 @@ def build_minecraft_dataset(
             "seed": seed,
             "data_format": data_format,
             "image_root": image_root,
+            "text_only": text_only,
         },
         remove_columns=raw_columns,
     )
     dataset = dataset.filter(lambda x: x["_keep"])
     dataset = dataset.remove_columns(["_keep"])
     return dataset
+
+
+# ─── model helpers ─────────────────────────────────────────────────────────────
+
+# Substrings matched (case-insensitively) against each submodule's own leaf name (not
+# its full dotted path) to find the vision tower. For the Qwen2-VL / Qwen2.5-VL /
+# Qwen3-VL / Qwen3.5-VL family the ViT + patch-merger both live under a single
+# submodule literally named "visual" (e.g. `model.visual`, containing `patch_embed`,
+# `blocks`, AND `merger`) -- so freezing that one submodule already freezes the
+# encoder and the vision-to-text adapter together, matching JARVIS-VLA's Stage I
+# recipe of "ViT + adapter frozen, only the LLM backbone trained". The other hints are
+# fallbacks for other VLM architectures that split the encoder/adapter differently.
+_VISION_SUBMODULE_HINTS = ("visual", "vision_tower", "vision_model", "image_encoder")
+
+
+def freeze_vision_tower(model: torch.nn.Module) -> None:
+    """
+    Freeze the vision encoder (+ its adapter/merger into the LLM's embedding space),
+    leaving only the language-model backbone trainable. This is JARVIS-VLA's Stage I
+    ("Minecraft world knowledge" text-only post-training) recipe: only the LLM is
+    updated while the vision tower stays frozen; Stage II then unfreezes everything
+    again once real image data (VQA/captioning/grounding) is introduced -- so this
+    should only be called for the Stage I / `--text_only` run, not Stage II.
+
+    Walks `model.named_modules()` looking for a submodule whose *own* name (not its
+    full dotted path) matches one of `_VISION_SUBMODULE_HINTS`, and sets
+    `requires_grad_(False)` on every parameter under it. Only the outermost matching
+    submodule per branch is frozen (a submodule nested inside an already-frozen one is
+    skipped) to avoid redundant work and confusing double-counting in the log message.
+
+    Raises `RuntimeError` if no matching submodule is found at all -- silently no-op'ing
+    here would be far worse than crashing, since it would look like Stage I is running
+    correctly while actually training the full model (vision tower included).
+    """
+    frozen_modules: List[str] = []
+    frozen_params = 0
+
+    for name, module in model.named_modules():
+        if not name:
+            continue
+        leaf_name = name.rsplit(".", 1)[-1].lower()
+        if not any(hint in leaf_name for hint in _VISION_SUBMODULE_HINTS):
+            continue
+        if any(name == m or name.startswith(f"{m}.") for m in frozen_modules):
+            continue  # nested inside an already-frozen submodule
+
+        n = 0
+        for p in module.parameters():
+            if p.requires_grad:
+                p.requires_grad_(False)
+                n += p.numel()
+        if n > 0:
+            frozen_modules.append(name)
+            frozen_params += n
+
+    if not frozen_modules:
+        raise RuntimeError(
+            "freeze_vision_tower: could not find any submodule matching "
+            f"{_VISION_SUBMODULE_HINTS} (case-insensitive, matched against each "
+            "submodule's own leaf name) on this model. Inspect `model.named_modules()` "
+            "for this architecture and extend `_VISION_SUBMODULE_HINTS`."
+        )
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(
+        f"freeze_vision_tower: froze {frozen_modules} ({frozen_params:,} params). "
+        f"Trainable now: {trainable_params:,} / {total_params:,} "
+        f"({100 * trainable_params / total_params:.1f}%)."
+    )
 
 
 # ─── debug / dry-run helpers ──────────────────────────────────────────────────
@@ -483,6 +653,8 @@ def debug_dry_run(args):
         trust_remote_code=True,
         attn_implementation=args.attn_implementation,
     )
+    if args.freeze_vision_tower:
+        freeze_vision_tower(model)
 
     logger.info("Building dataset (real `build_minecraft_dataset` code path)...")
     dataset = build_minecraft_dataset(
@@ -492,6 +664,7 @@ def debug_dry_run(args):
         seed=args.seed,
         data_format=args.data_format,
         image_root=args.image_root,
+        text_only=args.text_only,
     )
 
     sft_config_field_names = {f.name for f in dataclass_fields(SFTConfig)}
@@ -557,12 +730,36 @@ def main():
         "relative path(s) are resolved against. Defaults to the directory containing "
         "--data_path (matches minecraft-vlp's <root>/*.jsonl + <root>/images/ layout).",
     )
+    parser.add_argument(
+        "--text_only",
+        action="store_true",
+        help="Stage I mode (JARVIS-VLA's 'Minecraft world knowledge' text-only "
+        "post-training): treat every row as plain system+user+assistant text QA with "
+        "no images (e.g. minecraft-vlp/mc-qa-*.jsonl), producing samples with no "
+        "'images' key so SFTTrainer uses its plain-text collator instead of the "
+        "vision-language one. Typically combined with --freeze_vision_tower.",
+    )
+    parser.add_argument(
+        "--freeze_vision_tower",
+        action="store_true",
+        help="Freeze the vision encoder + adapter/merger, training only the LLM "
+        "backbone -- matches JARVIS-VLA's Stage I recipe. Typically combined with "
+        "--text_only.",
+    )
     parser.add_argument("--output_dir", type=str, default="./output")
     parser.add_argument("--max_turns", type=int, default=4, help="Max (user,assistant) pairs per sample")
     parser.add_argument("--max_seq_length", type=int, default=16384)
     parser.add_argument("--per_device_batch_size", type=int, default=2)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--num_train_epochs", type=int, default=1)
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=None,
+        help="Explicit total training steps, overriding the built-in dataset-size "
+        "estimate below (which is specific to minecraft-text-action-dataset and wrong "
+        "for any other dataset -- always pass this for --text_only/--data_format=jsonl runs).",
+    )
     parser.add_argument("--learning_rate", type=float, default=8e-6)
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine")
@@ -618,6 +815,8 @@ def main():
         trust_remote_code=True,
         attn_implementation=args.attn_implementation,
     )
+    if args.freeze_vision_tower:
+        freeze_vision_tower(model)
 
     # ── load dataset ──
     # For large S3 datasets, use streaming to avoid downloading everything.
@@ -632,16 +831,30 @@ def main():
         seed=args.seed,
         data_format=args.data_format,
         image_root=args.image_root,
+        text_only=args.text_only,
     )
 
     # ── training config ──
     total_batch_size = args.per_device_batch_size * args.gradient_accumulation_steps
     # For torchrun, world_size is available via env
     n_gpus = int(os.environ.get("WORLD_SIZE", os.environ.get("LOCAL_WORLD_SIZE", 1)))
-    # Compute max_steps from approximate dataset size
-    # 363 files × ~600 samples each ≈ 217800 samples per epoch
-    approx_dataset_size = 217800
-    max_steps = (approx_dataset_size * args.num_train_epochs) // (total_batch_size * n_gpus)
+    if args.max_steps is not None:
+        max_steps = args.max_steps
+    else:
+        # Compute max_steps from approximate dataset size. This magic number is
+        # `minecraft-text-action-dataset`-specific (363 files x ~600 samples each ~=
+        # 217800 samples per epoch) -- it does NOT apply to other datasets/formats
+        # (e.g. --text_only Stage I data, which has a very different row count). Pass
+        # --max_steps explicitly for anything other than the default parquet dataset.
+        if args.text_only or args.data_format == "jsonl":
+            logger.warning(
+                "No --max_steps given and --text_only/--data_format=jsonl is set: "
+                "falling back to the minecraft-text-action-dataset-specific sample-count "
+                "estimate below, which is almost certainly wrong for this dataset. Pass "
+                "--max_steps explicitly."
+            )
+        approx_dataset_size = 217800
+        max_steps = (approx_dataset_size * args.num_train_epochs) // (total_batch_size * n_gpus)
 
     # `SFTConfig`'s max-sequence-length kwarg was renamed from `max_seq_length` to
     # `max_length` in newer TRL releases. Detect which one the installed TRL expects
