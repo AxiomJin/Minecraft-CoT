@@ -1,8 +1,11 @@
 """
 TRL-based SFT training for Minecraft text-action VLM.
 
-Data: s3://arcwm-code-us-west-2/axiom/data/minecraft-text-action-dataset/
-Model: s3://arcwm-code-us-west-2/axiom/model/Qwen3.5-9B/
+Data (two supported layouts, see `build_minecraft_dataset`):
+  - parquet trajectories: s3://arcwm-code-us-west-2/axiom/data/minecraft-text-action-dataset/
+  - jsonl flat QA (e.g. minecraft-vlp): s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp/
+Model: s3://arcwm-code-us-west-2/axiom/model/Qwen3.5-9B/ (also works for Qwen2-VL /
+    Qwen2.5-VL / Qwen3-VL under s3://arcwm-code-us-west-2/axiom/model/)
 
 Usage:
     torchrun --nproc_per_node=$NPROC train_sft.py \
@@ -15,6 +18,13 @@ Usage:
         --gradient_accumulation_steps 4 \
         --num_train_epochs 1 \
         --deepspeed ds_zero2.json
+
+    # jsonl / flat-QA layout (e.g. minecraft-vlp), --data_format auto-detected from the
+    # ".jsonl" extension; --image_root defaults to the directory containing --data_path:
+    torchrun --nproc_per_node=$NPROC train_sft.py \
+        --model_path s3://arcwm-code-us-west-2/axiom/model/Qwen2-VL-7B-Instruct \
+        --data_path s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp/mc-vqa-241102.jsonl \
+        --output_dir ./output
 
 NOTE on VLM + TRL:
   - All target models (Qwen2-VL / Qwen2.5-VL / Qwen3-VL / Qwen3.5-VL) are vision-language
@@ -152,16 +162,38 @@ def build_messages(
     start_idx = start_turn * 2
 
     selected_convs = conversations[start_idx:]
-    selected_images = image_bytes_list[start_turn:] if image_bytes_list else []
+    # NOTE: this slices `image_bytes_list` by *pair index* (`start_turn`), which matches
+    # `minecraft-text-action-dataset`'s parquet schema: exactly one `image_bytes` entry
+    # per (user, assistant) trajectory step, regardless of whether that step's user turn
+    # actually contains an image placeholder. This is different from the FLAT,
+    # encounter-order indexing that `_split_prompt_completion_with_images` below uses for
+    # the actual placeholder <-> bytes matching -- see `build_messages_qa` for a dataset
+    # format (`minecraft-vlp`) where that flat/no-slicing behavior is what's needed
+    # instead.
+    selected_image_bytes = image_bytes_list[start_turn:] if image_bytes_list else []
 
-    # Build messages, keeping image placeholders in-place (to preserve
-    # text/image interleaving order) and collecting the actual decoded
-    # images into a separate flat list.
+    return _split_prompt_completion_with_images(selected_convs, selected_image_bytes)
+
+
+def _split_prompt_completion_with_images(
+    conversations: List[Dict],
+    image_bytes_list: List[bytes],
+) -> Tuple[List[Dict], List[Dict], List[Image.Image]]:
+    """
+    Shared tail used by both `build_messages` (trajectory/parquet rows) and
+    `build_messages_qa` (flat QA/jsonl rows): walks `conversations`, keeps
+    `{"type": "image"}` placeholders in-place (to preserve text/image interleaving
+    order) while decoding the matching entry of the FLAT `image_bytes_list` (one entry
+    per placeholder, in encounter order across the whole `conversations` list -- NOT
+    per-turn) into a separate flat `images` list. Finally splits off the final
+    assistant turn as `completion`; everything before it becomes `prompt` (context that
+    `SFTConfig(completion_only_loss=True)` will mask out of the loss).
+    """
     messages = []
     images: List[Image.Image] = []
     image_idx = 0
 
-    for conv in selected_convs:
+    for conv in conversations:
         role = conv["role"]
         content_list = []
 
@@ -169,9 +201,9 @@ def build_messages(
             if item.get("type") == "text":
                 content_list.append({"type": "text", "text": item.get("text", "")})
             elif item.get("type") == "image":
-                if image_idx < len(selected_images):
+                if image_idx < len(image_bytes_list):
                     try:
-                        img = Image.open(io.BytesIO(selected_images[image_idx])).convert("RGB")
+                        img = Image.open(io.BytesIO(image_bytes_list[image_idx])).convert("RGB")
                         content_list.append({"type": "image"})
                         images.append(img)
                     except Exception as e:
@@ -188,9 +220,77 @@ def build_messages(
     return prompt, completion, images
 
 
-def _row_to_trl_sample(sample: Dict, idx: int, max_turns: int, seed: int) -> Dict:
+def _read_bytes(uri: str) -> bytes:
+    """Read raw bytes from a local path or any `fsspec`-supported URI (e.g. `s3://...`,
+    via the `s3fs` dependency)."""
+    import fsspec
+
+    with fsspec.open(uri, "rb") as f:
+        return f.read()
+
+
+def build_messages_qa(
+    conversations: list,
+    image_paths: list,
+    image_root: str,
+) -> Tuple[Optional[List[Dict]], Optional[List[Dict]], Optional[List[Image.Image]]]:
     """
-    Map ONE raw parquet row to a TRL prompt/completion/images sample.
+    Convert one JSONL "flat QA" row (e.g. `minecraft-vlp/*.jsonl`) into the same TRL
+    prompt/completion/images format as `build_messages`, but WITHOUT the
+    trajectory-specific history-window sampling: these rows are short, independent
+    multi-turn Q&A sessions about a small, fixed set of images (declared once in the
+    row's "image" field, referenced by whichever `{"type": "image"}` placeholder(s)
+    appear anywhere in `conversations`, in encounter order) rather than a long
+    sequential trajectory of (image, action) steps -- so there is no "history length"
+    to randomly truncate. Keeping the whole conversation also guarantees any image
+    placeholder (almost always in the first user turn) always stays inside the
+    resulting `prompt` instead of possibly being sliced away.
+
+    Args:
+        conversations: list of {role, content[{type, text/image}]}, same schema as
+            `build_messages`.
+        image_paths: list of paths *relative to `image_root`* (as stored in the row's
+            "image" field), one entry per `{"type": "image"}` placeholder in encounter
+            order across the whole conversation.
+        image_root: directory (local path or any `fsspec` URI, e.g.
+            "s3://bucket/prefix") that `image_paths` entries are relative to -- normally
+            the directory containing the jsonl file itself; see
+            `build_minecraft_dataset`/`_default_image_root`.
+    """
+    if not conversations or len(conversations) < 2:
+        return None, None, None
+
+    if conversations[0]["role"] != "user":
+        conversations = conversations[1:]
+    if not conversations or conversations[-1]["role"] != "assistant":
+        return None, None, None
+
+    image_bytes_list: List[bytes] = []
+    for rel_path in image_paths or []:
+        uri = f"{image_root.rstrip('/')}/{str(rel_path).lstrip('/')}"
+        try:
+            image_bytes_list.append(_read_bytes(uri))
+        except Exception as e:
+            logger.warning(f"Failed to read image {uri}: {e}")
+            # Keep a (deliberately undecodable) placeholder so the flat index stays in
+            # sync with the placeholders in `conversations`; it will simply fail to
+            # decode below and fall back to a "[image]" text placeholder.
+            image_bytes_list.append(b"")
+
+    return _split_prompt_completion_with_images(conversations, image_bytes_list)
+
+
+def _row_to_trl_sample(
+    sample: Dict,
+    idx: int,
+    max_turns: int,
+    seed: int,
+    data_format: str,
+    image_root: Optional[str],
+) -> Dict:
+    """
+    Map ONE raw dataset row (parquet trajectory step OR jsonl QA session, per
+    `data_format`) to a TRL prompt/completion/images sample.
 
     This is used as the `function` argument of `datasets.Dataset.map` /
     `datasets.IterableDataset.map` (with `with_indices=True`) rather than being wrapped
@@ -204,28 +304,55 @@ def _row_to_trl_sample(sample: Dict, idx: int, max_turns: int, seed: int) -> Dic
     the sharding/streaming machinery documented in `build_minecraft_dataset` still
     applies unchanged.
 
-    Uses a *local* RNG keyed by the sample's own stable "id" (not `idx`, the
+    For `data_format == "parquet"` (`minecraft-text-action-dataset`-style trajectory
+    rows), uses a *local* RNG keyed by the sample's own stable "id" (not `idx`, the
     stream-position/row index) so that (a) different ranks/workers never happen to
     reuse the same seed for "the k-th sample they each see locally" -- which they
     otherwise would, since after sharding every rank/worker's local stream position
-    resets to 0 -- and (b) we don't mutate the global `random` module state as a
-    side effect.
+    resets to 0 -- and (b) we don't mutate the global `random` module state as a side
+    effect. For `data_format == "jsonl"` (`minecraft-vlp`-style flat QA rows,
+    `build_messages_qa`) there is no history sampling, so no RNG is needed.
 
     Invalid rows are flagged via `"_keep": False` instead of being dropped here (a
     `.map()` function must return exactly one output row per input row); the caller
     chains `.filter(lambda x: x["_keep"])` afterwards to actually drop them.
     """
     sample_id = sample.get("id", idx)
-    rng = random.Random(f"{seed}-{sample_id}")
-    prompt, completion, images = build_messages(
-        conversations=sample["conversations"],
-        image_bytes_list=sample.get("image_bytes", []),
-        max_turns=max_turns,
-        rng=rng,
-    )
+    if data_format == "jsonl":
+        prompt, completion, images = build_messages_qa(
+            conversations=sample["conversations"],
+            image_paths=sample.get("image", []),
+            image_root=image_root,
+        )
+    else:
+        rng = random.Random(f"{seed}-{sample_id}")
+        prompt, completion, images = build_messages(
+            conversations=sample["conversations"],
+            image_bytes_list=sample.get("image_bytes", []),
+            max_turns=max_turns,
+            rng=rng,
+        )
     if prompt is None:
         return {"prompt": [], "completion": [], "images": [], "_keep": False}
     return {"prompt": prompt, "completion": completion, "images": images, "_keep": True}
+
+
+def _detect_data_format(data_path: str) -> str:
+    """Infer "parquet" vs "jsonl" from the file extension in `data_path` (which may be a
+    glob, e.g. "s3://.../train-*.parquet" or "s3://.../*.jsonl")."""
+    lowered = data_path.lower()
+    if ".jsonl" in lowered or ".json" in lowered:
+        return "jsonl"
+    return "parquet"
+
+
+def _default_image_root(data_path: str) -> str:
+    """Directory containing `data_path`'s file(s) -- e.g. for
+    "s3://bucket/minecraft-vlp/mc-vqa-241102.jsonl" (or the glob
+    "s3://bucket/minecraft-vlp/*.jsonl") this is "s3://bucket/minecraft-vlp". That is
+    also where `minecraft-vlp`-style datasets keep their `images/` subdirectory, which
+    is what each row's "image" (relative-path) field is rooted at."""
+    return data_path.rsplit("/", 1)[0]
 
 
 def build_minecraft_dataset(
@@ -233,14 +360,31 @@ def build_minecraft_dataset(
     max_turns: int = 4,
     streaming: bool = False,
     seed: int = 42,
+    data_format: str = "auto",
+    image_root: Optional[str] = None,
 ):
     """
     Build the Minecraft SFT dataset as a genuine `datasets.Dataset` (`streaming=False`)
     or `datasets.IterableDataset` (`streaming=True`) of TRL prompt-completion samples:
         {"prompt": [...], "completion": [...], "images": [PIL.Image, ...]}
-    (see `build_messages` for why prompt/completion instead of a flat `messages` list --
-    it's what lets `SFTConfig(completion_only_loss=True)` mask context/history out of the
-    loss for VLM training). Images are decoded from bytes on-the-fly (not cached).
+    (see `build_messages`/`build_messages_qa` for why prompt/completion instead of a
+    flat `messages` list -- it's what lets `SFTConfig(completion_only_loss=True)` mask
+    context/history out of the loss for VLM training).
+
+    Supports two on-disk layouts, auto-detected from `data_path`'s extension (override
+    with `data_format="parquet"` or `data_format="jsonl"`):
+      - "parquet" (e.g. `minecraft-text-action-dataset`): each row is one trajectory
+        with a `conversations` list plus an `image_bytes` list (one raw-JPEG-bytes
+        entry per (user, assistant) turn pair); `build_messages` randomly samples a
+        suffix history window (`max_turns`) from it. Images are decoded from the
+        already-embedded bytes.
+      - "jsonl" (e.g. `minecraft-vlp`): each row is a short, independent multi-turn Q&A
+        session with an `image` field listing path(s) *relative to `image_root`*
+        (default: the directory containing the jsonl file(s), which matches
+        `minecraft-vlp`'s layout of `<root>/*.jsonl` + `<root>/images/...`);
+        `build_messages_qa` loads those bytes on-the-fly via `fsspec` (works for both
+        local paths and `s3://` URIs, the latter via the `s3fs` dependency) and keeps
+        the whole conversation (no history sampling -- these rows are already short).
 
     IMPORTANT: this returns the result of chaining `.map()` / `.filter()` /
     `.remove_columns()` directly on `datasets.load_dataset(...)`'s return value -- NOT a
@@ -251,7 +395,7 @@ def build_minecraft_dataset(
     replaces). Chaining `.map()`/`.filter()` on the loaded dataset keeps the returned
     object a real `datasets`-library type while preserving all sharding behavior:
       - Cross-rank sharding uses `datasets.distributed.split_dataset_by_node`, applied
-        *before* `.map()`, so each rank only streams/transforms its own parquet shards
+        *before* `.map()`, so each rank only streams/transforms its own shards
         (instead of every rank pulling the full dataset over the network).
       - Cross-worker sharding (when `dataloader_num_workers > 0`) needs no extra code:
         `.map()`/`.filter()` on an `IterableDataset` just wrap the underlying shard
@@ -264,23 +408,36 @@ def build_minecraft_dataset(
     when `streaming=True` (the default for large S3 datasets), only iteration is
     supported -- `len()` is undefined, matching `datasets.IterableDataset` semantics.
     """
+    if data_format == "auto":
+        data_format = _detect_data_format(data_path)
+    if data_format not in ("parquet", "jsonl"):
+        raise ValueError(f"Unknown data_format: {data_format!r} (expected 'parquet', 'jsonl', or 'auto')")
+    if data_format == "jsonl" and image_root is None:
+        image_root = _default_image_root(data_path)
+
+    builder_name = "parquet" if data_format == "parquet" else "json"
     if streaming:
-        dataset = load_dataset("parquet", data_files=data_path, split="train", streaming=True)
+        dataset = load_dataset(builder_name, data_files=data_path, split="train", streaming=True)
         rank = int(os.environ.get("RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
         if world_size > 1:
             dataset = split_dataset_by_node(dataset, rank=rank, world_size=world_size)
             logger.info(f"Sharded streaming dataset across {world_size} ranks (this rank={rank}).")
-        logger.info("Dataset loaded in streaming mode (length unknown ahead of time)")
+        logger.info(f"Dataset loaded in streaming mode (format={data_format}, length unknown ahead of time)")
     else:
-        dataset = load_dataset("parquet", data_files=data_path, split="train")
-        logger.info(f"Dataset loaded: {len(dataset)} samples")
+        dataset = load_dataset(builder_name, data_files=data_path, split="train")
+        logger.info(f"Dataset loaded (format={data_format}): {len(dataset)} samples")
 
     raw_columns = dataset.column_names
     dataset = dataset.map(
         _row_to_trl_sample,
         with_indices=True,
-        fn_kwargs={"max_turns": max_turns, "seed": seed},
+        fn_kwargs={
+            "max_turns": max_turns,
+            "seed": seed,
+            "data_format": data_format,
+            "image_root": image_root,
+        },
         remove_columns=raw_columns,
     )
     dataset = dataset.filter(lambda x: x["_keep"])
@@ -293,14 +450,19 @@ def build_minecraft_dataset(
 
 def debug_dry_run(args):
     """
-    Quick dry-run against a real GPU:
+    Quick END-TO-END smoke test against a real GPU, using the exact same code path as
+    real training:
       1. Download the model, load processor + model.
-      2. Pull one sample from the dataset, build (prompt, completion, images).
-      3. Run the SAME `DataCollatorForVisionLanguageModeling` that `SFTTrainer` would
-         use, on a mini-batch of 2 samples -- this is what actually catches
-         VLM/packing/dataset-format incompatibilities, unlike a hand-rolled
-         processor(...) call which can silently skip the real training code path.
-      4. Run a forward + backward pass (no optimizer step) to make sure gradients flow.
+      2. Build the REAL training dataset via `build_minecraft_dataset` (same function
+         `main()` calls) -- this is what actually catches `train_dataset`
+         type/format incompatibilities with `SFTTrainer` (e.g. a hand-rolled
+         `torch.utils.data.IterableDataset` raises `TypeError` at trainer-construction
+         time; a manual `processor(...)`/collator-only test would never hit that code
+         path at all).
+      3. Construct a real `SFTTrainer` with a tiny `SFTConfig` (`max_steps=2`, no
+         checkpoint saving, no external logging) and call `.train()` -- this exercises
+         dataset iteration, the vision-language collator, forward, backward, and an
+         optimizer step through the *exact* same trainer code real training uses.
     """
     logger.info("=== DEBUG DRY RUN ===")
     logger.info(f"Model: {args.model_path}")
@@ -309,7 +471,9 @@ def debug_dry_run(args):
     # Download model into a cache dir specific to this model (avoids reusing a
     # stale download from a previously-tested model in the same container).
     cache_dir = args.download_model or f"/tmp/{_local_cache_name(args.model_path)}"
-    local_model = download_from_s3(args.model_path.rstrip("/"), cache_dir)
+    local_model = args.model_path
+    if args.model_path.startswith("s3://"):
+        local_model = download_from_s3(args.model_path.rstrip("/"), cache_dir)
 
     logger.info("Loading model & processor...")
     processor = AutoProcessor.from_pretrained(local_model, trust_remote_code=True)
@@ -317,61 +481,56 @@ def debug_dry_run(args):
         local_model,
         dtype=torch.bfloat16,
         trust_remote_code=True,
-        device_map="auto",
         attn_implementation=args.attn_implementation,
     )
 
-    # Load a couple of samples
-    ds = load_dataset("parquet", data_files=args.data_path, split="train", streaming=True)
-    it = iter(ds)
-    samples = [next(it) for _ in range(2)]
-
-    examples = []
-    for sample in samples:
-        prompt, completion, images = build_messages(
-            conversations=sample["conversations"],
-            image_bytes_list=sample.get("image_bytes", []),
-            max_turns=args.max_turns,
-        )
-        if prompt is None:
-            continue
-        examples.append({"prompt": prompt, "completion": completion, "images": images})
-
-    if not examples:
-        raise RuntimeError("Could not build any valid (prompt, completion, images) example from the dataset sample.")
-
-    for i, ex in enumerate(examples):
-        n_img = len(ex["images"])
-        n_turns = len(ex["prompt"]) + len(ex["completion"])
-        logger.info(f"  sample[{i}]: turns={n_turns}, images={n_img}")
-
-    # ── this is the part that actually exercises the SFTTrainer code path ──
-    from trl.trainer.sft_trainer import DataCollatorForVisionLanguageModeling
-
-    # `completion_only_loss=True` mirrors the training config below: loss must only be
-    # computed on the target "Action: ..." completion, never on prompt/history/images.
-    collator = DataCollatorForVisionLanguageModeling(
-        processor, max_length=args.max_seq_length, completion_only_loss=True
+    logger.info("Building dataset (real `build_minecraft_dataset` code path)...")
+    dataset = build_minecraft_dataset(
+        data_path=args.data_path,
+        max_turns=args.max_turns,
+        streaming=True,
+        seed=args.seed,
+        data_format=args.data_format,
+        image_root=args.image_root,
     )
-    logger.info("Running DataCollatorForVisionLanguageModeling on the mini-batch...")
-    batch = collator(examples)
-    for k, v in batch.items():
-        if isinstance(v, torch.Tensor):
-            logger.info(f"  {k}: {v.shape} ({v.dtype})")
-        else:
-            logger.info(f"  {k}: {type(v).__name__}")
 
-    device = next(model.parameters()).device
-    batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+    sft_config_field_names = {f.name for f in dataclass_fields(SFTConfig)}
+    max_len_kwarg = {}
+    if "max_length" in sft_config_field_names:
+        max_len_kwarg["max_length"] = args.max_seq_length
+    elif "max_seq_length" in sft_config_field_names:
+        max_len_kwarg["max_seq_length"] = args.max_seq_length
 
-    logger.info("Running forward + backward pass...")
-    outputs = model(**batch)
-    if outputs.loss is None:
-        raise RuntimeError("Model forward pass did not return a loss; check labels/collator output.")
-    logger.info(f"Loss: {outputs.loss.item():.4f}")
-    outputs.loss.backward()
-    logger.info("Backward pass OK (gradients computed).")
-    logger.info("=== DRY RUN PASSED ===")
+    debug_output_dir = os.path.join(args.output_dir, "_debug_dry_run")
+    training_args = SFTConfig(
+        output_dir=debug_output_dir,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        max_steps=2,
+        learning_rate=args.learning_rate,
+        bf16=True,
+        logging_steps=1,
+        save_strategy="no",
+        dataloader_num_workers=0,
+        remove_unused_columns=False,
+        packing=False,
+        completion_only_loss=True,
+        seed=args.seed,
+        report_to=["none"],
+        **max_len_kwarg,
+    )
+
+    logger.info("Constructing SFTTrainer (this is where a bad train_dataset type/format would raise)...")
+    trainer = SFTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        processing_class=processor,
+    )
+
+    logger.info("Running trainer.train() for max_steps=2...")
+    trainer.train()
+    logger.info("=== DRY RUN PASSED (SFTTrainer built + trained for 2 steps successfully) ===")
 
 
 # ─── main training ────────────────────────────────────────────────────────────
@@ -380,7 +539,24 @@ def debug_dry_run(args):
 def main():
     parser = argparse.ArgumentParser(description="TRL SFT for Minecraft VLM")
     parser.add_argument("--model_path", type=str, required=True, help="S3 or local path to model")
-    parser.add_argument("--data_path", type=str, required=True, help="S3 glob or local path to parquet files")
+    parser.add_argument("--data_path", type=str, required=True, help="S3 glob or local path to parquet/jsonl files")
+    parser.add_argument(
+        "--data_format",
+        type=str,
+        default="auto",
+        choices=["auto", "parquet", "jsonl"],
+        help="'parquet' (e.g. minecraft-text-action-dataset, embedded image_bytes) or "
+        "'jsonl' (e.g. minecraft-vlp, images loaded from an 'image_root' via relative "
+        "paths). 'auto' (default) infers from --data_path's extension.",
+    )
+    parser.add_argument(
+        "--image_root",
+        type=str,
+        default=None,
+        help="Only used for --data_format=jsonl: base dir/URI that each row's 'image' "
+        "relative path(s) are resolved against. Defaults to the directory containing "
+        "--data_path (matches minecraft-vlp's <root>/*.jsonl + <root>/images/ layout).",
+    )
     parser.add_argument("--output_dir", type=str, default="./output")
     parser.add_argument("--max_turns", type=int, default=4, help="Max (user,assistant) pairs per sample")
     parser.add_argument("--max_seq_length", type=int, default=16384)
@@ -395,7 +571,12 @@ def main():
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--deepspeed", type=str, default=None, help="Path to DeepSpeed config JSON")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--debug", action="store_true", help="Dry-run: load 1 sample, collate, forward+backward, exit")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Dry-run: build the real dataset, construct a real SFTTrainer, train for "
+        "max_steps=2, exit (no checkpoint saved).",
+    )
     parser.add_argument("--download_model", type=str, default=None, help="Local dir to cache downloaded model")
     parser.add_argument("--attn_implementation", type=str, default="flash_attention_2")
     # NOTE: TRL's SFTTrainer raises ValueError for packing=True on vision-language
@@ -449,6 +630,8 @@ def main():
         max_turns=args.max_turns,
         streaming=True,
         seed=args.seed,
+        data_format=args.data_format,
+        image_root=args.image_root,
     )
 
     # ── training config ──
