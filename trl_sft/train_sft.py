@@ -378,6 +378,30 @@ def build_messages_text_only(conversations: list) -> Tuple[Optional[List[Dict]],
     return prompt, completion
 
 
+# TRL's `SFTTrainer` tokenizes `prompt` alone (with `add_generation_prompt=True`) and
+# `prompt + completion` together, then checks that the former is a token-for-token
+# PREFIX of the latter to compute `completion_mask` (see
+# "Mismatch between tokenized prompt..." warning). For any Qwen3.x-family "thinking"
+# chat template, leaving `enable_thinking` unset makes these two renderings literally
+# different strings at the assistant turn: `add_generation_prompt=True` alone emits an
+# UNCLOSED `<think>\n`, while the full prompt+completion render (assistant turn with
+# empty `reasoning_content`) emits a CLOSED `<think>\n\n</think>\n\n`. Text-wise the
+# former IS a character-prefix of the latter, but the tokenizer is not prefix-stable
+# across that specific `\n`+`\n` boundary (verified against the real Qwen3.5-9B
+# tokenizer: "<think>\n" tokenizes with a trailing lone `\n` token, but the same
+# characters as a prefix of "<think>\n\n</think>\n\n..." get merged into a single
+# double-newline token) -- so `len(prompt_ids)` ends up 2 tokens short of the true
+# prompt/completion boundary, and those 2 boilerplate tokens (`</think>` + the
+# following blank line) leak into the loss on every single sample. Passing
+# `enable_thinking=False` explicitly makes `add_generation_prompt=True` ALSO emit the
+# closed `<think>\n\n</think>\n\n` form, so both renderings share the exact same
+# literal string at the boundary and tokenize identically -- eliminates the mismatch
+# (verified with the real tokenizer). Harmless no-op for chat templates that don't
+# reference `enable_thinking` at all (e.g. Qwen2-VL/Qwen2.5-VL) since Jinja silently
+# ignores unused template variables.
+_CHAT_TEMPLATE_KWARGS: Dict = {"enable_thinking": False}
+
+
 def _row_to_trl_sample(
     sample: Dict,
     idx: int,
@@ -429,8 +453,13 @@ def _row_to_trl_sample(
     if text_only:
         prompt, completion = build_messages_text_only(conversations=sample["conversations"])
         if prompt is None:
-            return {"prompt": [], "completion": [], "_keep": False}
-        return {"prompt": prompt, "completion": completion, "_keep": True}
+            return {"prompt": [], "completion": [], "chat_template_kwargs": {}, "_keep": False}
+        return {
+            "prompt": prompt,
+            "completion": completion,
+            "chat_template_kwargs": _CHAT_TEMPLATE_KWARGS,
+            "_keep": True,
+        }
 
     if data_format == "jsonl":
         prompt, completion, images = build_messages_qa(
@@ -447,8 +476,14 @@ def _row_to_trl_sample(
             rng=rng,
         )
     if prompt is None:
-        return {"prompt": [], "completion": [], "images": [], "_keep": False}
-    return {"prompt": prompt, "completion": completion, "images": images, "_keep": True}
+        return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
+    return {
+        "prompt": prompt,
+        "completion": completion,
+        "images": images,
+        "chat_template_kwargs": _CHAT_TEMPLATE_KWARGS,
+        "_keep": True,
+    }
 
 
 def _detect_data_format(data_path: str) -> str:
