@@ -31,14 +31,49 @@ Usage:
     # minecraft-vlp/mc-qa-*.jsonl, label=["qa","wiki","self-instruct"]). --text_only
     # makes samples carry no "images" key (so SFTTrainer uses its plain-text collator,
     # not the vision one) and --freeze_vision_tower keeps the ViT+adapter frozen while
-    # only the LLM backbone is updated, matching the paper's Stage I recipe:
-    torchrun --nproc_per_node=$NPROC train_sft.py \
-        --model_path s3://arcwm-code-us-west-2/axiom/model/Qwen2-VL-7B-Instruct \
+    # only the LLM backbone is updated. Hyperparameters below match JARVIS-VLA's paper
+    # recipe as closely as feasible (LR=5e-6, AdamW beta2=0.95/wd=0, fixed 200-step
+    # warmup, grad-norm clip 1.0, global batch=256, DeepSpeed ZeRO-1, max_length=3584,
+    # seed=42) -- EXCEPT for two deliberate deviations:
+    #   (a) --gradient_accumulation_steps is scaled up from the paper's 4 to compensate
+    #       for using 8 GPUs here instead of the paper's 32 (2*16*8 = 2*4*32 = 256, so
+    #       the *effective* global batch is identical, training just takes longer
+    #       wall-clock);
+    #   (b) ds_zero1.json defines an EXPLICIT DeepSpeed-native "WarmupDecayLR" scheduler
+    #       with HARDCODED warmup_min_lr=0/warmup_max_lr=5e-6/warmup_num_steps=200/
+    #       total_num_steps=1077 (matching --learning_rate/--warmup_steps/--max_steps
+    #       below) rather than "auto"-filling those or letting --lr_scheduler_type=cosine
+    #       run as a plain HF scheduler under DeepSpeed. Both alternatives were tried
+    #       and empirically failed on this exact stack (transformers+deepspeed+
+    #       grad-accum=16): the plain-HF-scheduler-under-DeepSpeed path completed warmup
+    #       ~5-16x faster than the requested 200 steps, and "auto"-filling
+    #       scheduler.params.warmup_num_steps resolved via --warmup_ratio (not
+    #       --warmup_steps) and crashed with warmup_num_steps=0 once --warmup_ratio was
+    #       forced to 0 to disambiguate the first issue. Hardcoding the scheduler section
+    #       sidesteps both: reuse this ds_zero1.json for a *different* max_steps/lr/
+    #       warmup_steps combination requires updating it to match. The one remaining
+    #       deviation from the paper this introduces: WarmupDecayLR decays LINEARLY
+    #       after warmup, not via the paper's cosine schedule.
+    torchrun --nproc_per_node=8 train_sft.py \
+        --model_path s3://arcwm-code-us-west-2/axiom/model/Qwen3.5-9B \
         --data_path s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp/mc-qa-250312.jsonl \
         --text_only \
         --freeze_vision_tower \
-        --learning_rate 5e-6 \
         --max_seq_length 3584 \
+        --per_device_batch_size 2 \
+        --gradient_accumulation_steps 16 \
+        --num_train_epochs 1 \
+        --max_steps 1077 \
+        --learning_rate 5e-6 \
+        --lr_scheduler_type cosine \
+        --warmup_steps 200 \
+        --weight_decay 0.0 \
+        --adam_beta1 0.9 \
+        --adam_beta2 0.95 \
+        --adam_epsilon 1e-8 \
+        --max_grad_norm 1.0 \
+        --seed 42 \
+        --deepspeed ds_zero1.json \
         --output_dir ./output
 
 NOTE on VLM + TRL:
@@ -751,6 +786,14 @@ def main():
     parser.add_argument("--max_seq_length", type=int, default=16384)
     parser.add_argument("--per_device_batch_size", type=int, default=2)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Trade compute for activation memory -- recommended for large models / "
+        "long max_seq_length, especially when DeepSpeed optimizer-state offload isn't "
+        "available (e.g. due to a CUDA-toolkit/torch-build version mismatch preventing "
+        "DeepSpeedCPUAdam's JIT compile).",
+    )
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument(
         "--max_steps",
@@ -762,8 +805,25 @@ def main():
     )
     parser.add_argument("--learning_rate", type=float, default=8e-6)
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=0,
+        help="Fixed warmup step count. If > 0, this takes precedence over --warmup_ratio "
+        "(standard `transformers.TrainingArguments` behavior). JARVIS-VLA's Stage I/II "
+        "recipe uses a fixed 200-step warmup rather than a ratio.",
+    )
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine")
     parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--adam_beta1", type=float, default=0.9)
+    parser.add_argument(
+        "--adam_beta2",
+        type=float,
+        default=0.999,
+        help="HF Trainer default is 0.999; JARVIS-VLA's recipe uses 0.95.",
+    )
+    parser.add_argument("--adam_epsilon", type=float, default=1e-8)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--save_steps", type=int, default=100)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--deepspeed", type=str, default=None, help="Path to DeepSpeed config JSON")
@@ -868,6 +928,29 @@ def main():
     else:
         logger.warning("Neither `max_length` nor `max_seq_length` found on SFTConfig; skipping.")
 
+    # `TrainingArguments.warmup_ratio` was REMOVED as an `__init__` kwarg in some
+    # transformers releases (consistent with a "warmup_ratio is deprecated ... removed
+    # in v5.2" warning seen on affected versions) in favor of `warmup_steps` alone --
+    # passing `warmup_ratio=...` unconditionally would then raise `TypeError` at
+    # `SFTConfig(...)` construction time. Detect support the same way `max_length` vs
+    # `max_seq_length` is detected above, and only pass whichever of
+    # `warmup_steps`/`warmup_ratio` is actually needed: if `--warmup_steps > 0` is
+    # requested, always pass that (unambiguous on every version tested); otherwise fall
+    # back to `--warmup_ratio`, but only include it in the SFTConfig kwargs if the
+    # installed version still supports it (recent versions default warmup_ratio's
+    # effect to 0 when omitted, which is the same as passing 0.0 explicitly anyway).
+    warmup_kwargs: Dict[str, float] = {"warmup_steps": args.warmup_steps}
+    if args.warmup_steps <= 0:
+        if "warmup_ratio" in sft_config_field_names:
+            warmup_kwargs["warmup_ratio"] = args.warmup_ratio
+        else:
+            logger.warning(
+                "--warmup_ratio was requested but this installed version of "
+                "`trl`/`transformers` no longer accepts `warmup_ratio` on `SFTConfig`; "
+                "ignoring it. Pass --warmup_steps (an absolute step count) instead."
+            )
+    logger.info(f"Warmup config: {warmup_kwargs}")
+
     training_args = SFTConfig(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_batch_size,
@@ -876,9 +959,13 @@ def main():
         max_steps=max_steps,
         learning_rate=args.learning_rate,
         lr_scheduler_type=args.lr_scheduler_type,
-        warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
+        adam_beta1=args.adam_beta1,
+        adam_beta2=args.adam_beta2,
+        adam_epsilon=args.adam_epsilon,
+        max_grad_norm=args.max_grad_norm,
         bf16=True,
+        gradient_checkpointing=args.gradient_checkpointing,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=5,
@@ -896,10 +983,16 @@ def main():
         seed=args.seed,
         report_to=["wandb"] if os.environ.get("WANDB_API_KEY") else ["none"],
         run_name=os.environ.get("WANDB_RUN_NAME", "minecraft-sft-trl"),
+        **warmup_kwargs,
         **max_len_kwarg,
     )
 
     logger.info(f"Training config: total_batch={total_batch_size}, n_gpus={n_gpus}, max_steps={max_steps}")
+    logger.info(
+        f"Resolved training_args: warmup_steps={training_args.warmup_steps}, "
+        f"warmup_ratio={getattr(training_args, 'warmup_ratio', 'N/A')}, "
+        f"max_steps={training_args.max_steps}, learning_rate={training_args.learning_rate}"
+    )
 
     # ── trainer ──
     trainer = SFTTrainer(

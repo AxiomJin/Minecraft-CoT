@@ -3,9 +3,20 @@
 # SFTConfig renamed max_seq_length -> max_length around the same time. Older
 # pinned minimums here would silently resolve to versions that can't load
 # Qwen3-VL/Qwen3.5 configs at all, or crash on SFTConfig(max_seq_length=...).
+#
+# PINNED EXACTLY (not >=): unpinned ranges here were observed, on this exact repo, to
+# resolve to DIFFERENT transformers/trl releases across separate `pip install` runs
+# made only minutes apart (transformers 5.15.0 / trl 1.9.2 in one run, an older release
+# without that in another) -- and TrainingArguments.warmup_ratio was REMOVED as an
+# __init__ kwarg in one of those releases (consistent with the
+# "warmup_ratio is deprecated ... removed in v5.2" warning seen on the older one),
+# causing `SFTConfig(warmup_ratio=...)` to raise `TypeError` non-deterministically
+# depending purely on job-submission timing. Exact pins make training runs
+# reproducible; bump deliberately (and re-verify --debug) rather than letting `pip`
+# silently pick up new releases mid-experiment.
 torch>=2.4.0
-transformers>=4.57.0
-trl>=0.20.0
+transformers==5.15.0
+trl==1.9.2
 datasets>=3.0.0
 accelerate>=1.0.0
 deepspeed>=0.15.0
