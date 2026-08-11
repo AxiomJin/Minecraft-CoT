@@ -103,7 +103,7 @@ import random
 import sys
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from datasets import load_dataset
@@ -260,6 +260,21 @@ def _split_prompt_completion_with_images(
                         logger.warning(f"Failed to decode image at idx {image_idx}: {e}")
                         content_list.append({"type": "text", "text": "[image]"})
                 image_idx += 1
+            elif item.get("type") == "point":
+                # Grounding rows (e.g. minecraft-vlp/mc-grounding-point-*.jsonl, JARVIS-VLA
+                # Stage II spatial-grounding data): the assistant turn's answer is
+                # structured `{"point": [[x, y], ...], "label": "..."}` -- x/y are
+                # percentages (0-100) of image width/height, not pixels, and a single
+                # turn can list multiple points (e.g. "Spot the 2 slot" -> up to ~10
+                # points for repeated/ambiguous targets). There is no free-form "text"
+                # answer to fall back on, so serialize the coordinates into plain text
+                # the LM can actually be trained to generate: "(x, y)" per point,
+                # multiple points joined with "; ". This keeps the format simple/
+                # deterministic and resolution-independent (matches the 0-100 percentage
+                # scale already used by the raw labels).
+                points = item.get("point") or []
+                coord_text = "; ".join(f"({x:.2f}, {y:.2f})" for x, y in points)
+                content_list.append({"type": "text", "text": coord_text})
 
         # TRL expects roles: "user", "assistant", "system"
         messages.append({"role": role, "content": content_list})
@@ -486,26 +501,37 @@ def _row_to_trl_sample(
     }
 
 
-def _detect_data_format(data_path: str) -> str:
+def _detect_data_format(data_path: Union[str, List[str]]) -> str:
     """Infer "parquet" vs "jsonl" from the file extension in `data_path` (which may be a
-    glob, e.g. "s3://.../train-*.parquet" or "s3://.../*.jsonl")."""
-    lowered = data_path.lower()
-    if ".jsonl" in lowered or ".json" in lowered:
-        return "jsonl"
-    return "parquet"
+    glob, e.g. "s3://.../train-*.parquet" or "s3://.../*.jsonl", or (see
+    `build_minecraft_dataset`) a list of several such globs/paths -- in that case every
+    entry is checked and detection fails loudly on a mix of extensions rather than
+    silently guessing)."""
+    paths = data_path if isinstance(data_path, list) else [data_path]
+    formats = {"jsonl" if (".jsonl" in p.lower() or ".json" in p.lower()) else "parquet" for p in paths}
+    if len(formats) > 1:
+        raise ValueError(f"--data_path mixes parquet and jsonl extensions ({paths!r}); pass --data_format explicitly.")
+    return formats.pop()
 
 
-def _default_image_root(data_path: str) -> str:
+def _default_image_root(data_path: Union[str, List[str]]) -> str:
     """Directory containing `data_path`'s file(s) -- e.g. for
     "s3://bucket/minecraft-vlp/mc-vqa-241102.jsonl" (or the glob
     "s3://bucket/minecraft-vlp/*.jsonl") this is "s3://bucket/minecraft-vlp". That is
     also where `minecraft-vlp`-style datasets keep their `images/` subdirectory, which
-    is what each row's "image" (relative-path) field is rooted at."""
-    return data_path.rsplit("/", 1)[0]
+    is what each row's "image" (relative-path) field is rooted at.
+
+    When `data_path` is a list of several files (e.g. combining VQA + Caption +
+    Grounding jsonls for JARVIS-VLA Stage II), this uses the FIRST entry's directory --
+    only correct if every file lives directly alongside the others under the same
+    `<root>/images/...` layout (true for all of `minecraft-vlp`'s files); pass
+    `--image_root` explicitly if that doesn't hold."""
+    first = data_path[0] if isinstance(data_path, list) else data_path
+    return first.rsplit("/", 1)[0]
 
 
 def build_minecraft_dataset(
-    data_path: str,
+    data_path: Union[str, List[str]],
     max_turns: int = 4,
     streaming: bool = False,
     seed: int = 42,
@@ -782,7 +808,16 @@ def debug_dry_run(args):
 def main():
     parser = argparse.ArgumentParser(description="TRL SFT for Minecraft VLM")
     parser.add_argument("--model_path", type=str, required=True, help="S3 or local path to model")
-    parser.add_argument("--data_path", type=str, required=True, help="S3 glob or local path to parquet/jsonl files")
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        required=True,
+        help="S3 glob or local path to parquet/jsonl files. May be a comma-separated "
+        "list of several such paths/globs (e.g. to combine minecraft-vlp's "
+        "mc-vqa-*.jsonl + mc-caption-*.jsonl + mc-grounding-point-*.jsonl into one "
+        "dataset for JARVIS-VLA Stage II) -- each entry is passed through as-is (still "
+        "supports globs), just don't mix parquet and jsonl in the same list.",
+    )
     parser.add_argument(
         "--data_format",
         type=str,
@@ -879,6 +914,14 @@ def main():
     parser.add_argument("--no_packing", action="store_false", dest="packing")
 
     args = parser.parse_args()
+
+    # Allow --data_path to be a comma-separated list of files/globs (e.g. combining
+    # VQA + Caption + Grounding jsonls for JARVIS-VLA Stage II, which don't share a
+    # single glob pattern without also pulling in unrelated files like mc-qa-*.jsonl).
+    # `build_minecraft_dataset`/`_detect_data_format`/`_default_image_root` all accept
+    # either a plain str or a List[str] here.
+    if "," in args.data_path:
+        args.data_path = [p.strip() for p in args.data_path.split(",") if p.strip()]
 
     if args.packing:
         raise ValueError(
