@@ -210,3 +210,7 @@ __marimo__/
 *output/
 *toy*
 wandb/
+
+# WandB / other secrets: this repo is PUBLIC, never commit real keys.
+.env.wandb
+*.env.local

@@ -30,10 +30,19 @@ DATA_PATH="s3://arcwm-code-us-west-2/axiom/data/minecraft-text-action-dataset/da
 OUTPUT_DIR="./output"
 DOWNLOAD_CACHE="/tmp/qwen35_9b_cache"
 
-# W&B (set your own key)
-# export WANDB_API_KEY="your-key"
-# export WANDB_PROJECT="minecraft-sft"
-# export WANDB_RUN_NAME="trl-sft-v1"
+# W&B: sourced from a git-ignored local file (this repo is PUBLIC on GitHub -- never
+# commit a real key). Create trl_sft/.env.wandb with:
+#   export WANDB_API_KEY="your-key"
+#   export WANDB_PROJECT="minecraft-sft"
+#   export WANDB_RUN_NAME="trl-sft-v1"   # optional, defaults to "minecraft-sft-trl"
+# NOTE: this only helps for LOCAL runs of this script. For remote koala training jobs,
+# this file is NOT synced to S3 (same reason) -- export WANDB_API_KEY explicitly inside
+# the `koala submit -c "..."` command instead.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/.env.wandb" ]; then
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/.env.wandb"
+fi
 
 case "$MODE" in
     debug)
