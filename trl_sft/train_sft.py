@@ -568,6 +568,40 @@ def _row_to_trl_sample(
     }
 
 
+def _fast_encoded_length(
+    processor,
+    rendered: str,
+    images: List["Image.Image"],
+) -> int:
+    """Compute the exact token count `processor(text=[rendered], images=images)` would
+    produce, WITHOUT paying for the actual (expensive) pixel resize/rescale/normalize/
+    patchify work images go through -- only their (height, width) is needed.
+
+    Relies on `Qwen2VLProcessor`/`Qwen3VLProcessor`'s own public
+    `_get_num_multimodal_tokens(image_sizes=...)` (pure arithmetic on image dimensions
+    + the vision config's patch_size/merge_size/min_pixels/max_pixels -- see
+    `Qwen2VLImageProcessor.get_number_of_image_patches`/`smart_resize`) for the number
+    of vision tokens each image expands to, and combines that with a plain-text
+    tokenization of `rendered` (which -- pre-expansion -- contains exactly one literal
+    image-placeholder token per image, per both models' chat templates:
+    `<|vision_start|><|image_pad|><|vision_end|>`) to reconstruct the post-expansion
+    total length: `base_len - num_images + sum(num_image_tokens_per_image)`.
+
+    Verified byte-exact against the real `processor(...)` output across both Qwen2-VL
+    and Qwen3.5, for 1-5 images and image sizes spanning 1x1 to 7000x50 pixels (see
+    dev-time validation script; not shipped as a unit test to keep this file
+    dependency-light). Raises if `processor` doesn't support
+    `_get_num_multimodal_tokens` (caller falls back to the exact-but-slow path below).
+    """
+    raw_ids = processor.tokenizer(rendered, add_special_tokens=False)["input_ids"]
+    base_len = len(raw_ids)
+    if not images:
+        return base_len
+    image_sizes = [(im.height, im.width) for im in images]
+    num_tokens_per_image = processor._get_num_multimodal_tokens(image_sizes=image_sizes)["num_image_tokens"]
+    return base_len - len(images) + sum(num_tokens_per_image)
+
+
 def _exceeds_max_length(
     processor,
     prompt: List[Dict],
@@ -576,9 +610,9 @@ def _exceeds_max_length(
     max_seq_length: int,
     chat_template_kwargs: Optional[Dict] = None,
 ) -> bool:
-    """Re-tokenize `prompt+completion+images` with the REAL processor (same one used
-    for training) to get the exact token count `SFTTrainer`'s collator would produce,
-    and check whether it overflows `max_seq_length`.
+    """Compute `prompt+completion+images`'s token count under the REAL processor/
+    chat-template about to be used for training, and check whether it overflows
+    `max_seq_length`.
 
     This exists purely to pre-filter samples that would otherwise crash training (see
     `_row_to_trl_sample`'s docstring): unlike plain-text overflow (which the collator
@@ -591,8 +625,16 @@ def _exceeds_max_length(
     (crash) -- the dropped fraction is small and this is far cheaper than debugging a
     mid-run multi-GPU crash.
 
-    On any processor error (e.g. a malformed/corrupt image), also returns True
-    (drop defensively) rather than propagating the exception out of a `.map()` call.
+    Tries the cheap `_fast_encoded_length` path first (see its docstring -- avoids
+    redoing the SAME expensive image resize/rescale/normalize/patchify work the
+    collator is about to do for real on every image-bearing sample a SECOND time,
+    which was silently doubling image-preprocessing CPU cost per sample and capping
+    GPU utilization around 30% even after fixing the S3-read bottleneck separately).
+    Falls back to the exact-but-slower full `processor(...)` call if the fast path
+    raises (e.g. a future/different model class without `_get_num_multimodal_tokens`).
+
+    On any error from BOTH paths (e.g. a malformed/corrupt image), returns True (drop
+    defensively) rather than propagating the exception out of a `.map()` call.
     """
     try:
         rendered = processor.apply_chat_template(
@@ -601,12 +643,20 @@ def _exceeds_max_length(
             add_generation_prompt=False,
             **(chat_template_kwargs or {}),
         )
-        encoded = processor(text=[rendered], images=images, return_tensors=None)
-        total_len = len(encoded["input_ids"][0])
-        return total_len > max_seq_length
     except Exception as e:
-        logger.warning(f"Length pre-check failed for a sample ({e!r}); dropping it defensively.")
+        logger.warning(f"Length pre-check's apply_chat_template failed for a sample ({e!r}); dropping it defensively.")
         return True
+
+    try:
+        total_len = _fast_encoded_length(processor, rendered, images)
+    except Exception:
+        try:
+            encoded = processor(text=[rendered], images=images, return_tensors=None)
+            total_len = len(encoded["input_ids"][0])
+        except Exception as e:
+            logger.warning(f"Length pre-check failed for a sample ({e!r}); dropping it defensively.")
+            return True
+    return total_len > max_seq_length
 
 
 def _detect_data_format(data_path: Union[str, List[str]]) -> str:
@@ -1066,6 +1116,23 @@ def main():
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--save_steps", type=int, default=100)
     parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument(
+        "--dataloader_num_workers",
+        type=int,
+        default=4,
+        help=(
+            "Number of background `DataLoader` worker processes (per rank) used to "
+            "prefetch/preprocess samples (image decode/resize, tokenization) while the "
+            "GPU trains on the previous batch. With `--image_root` pointed at local "
+            "disk (see the training launch script's pre-download-to-/local-ssd step) "
+            "and `_exceeds_max_length`'s cheap size-only length pre-check (see its "
+            "docstring), the remaining per-sample CPU cost is dominated by the "
+            "collator's real image resize/rescale/normalize/patchify -- more workers "
+            "lets that run in parallel across CPU cores instead of serializing behind "
+            "GPU compute. Bump this further (e.g. 8) if GPU utilization is still low "
+            "after confirming images are being read from local disk, not S3."
+        ),
+    )
     parser.add_argument("--deepspeed", type=str, default=None, help="Path to DeepSpeed config JSON")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -1223,7 +1290,7 @@ def main():
         save_steps=args.save_steps,
         save_total_limit=5,
         deepspeed=args.deepspeed,
-        dataloader_num_workers=2,
+        dataloader_num_workers=args.dataloader_num_workers,
         remove_unused_columns=False,
         packing=False,  # unsupported for VLMs, see argparse note above
         # Loss must only be computed on the target "Action: ..." completion, not on the
