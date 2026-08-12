@@ -428,10 +428,39 @@ def build_messages_text_only(conversations: list) -> Tuple[Optional[List[Dict]],
 # `enable_thinking=False` explicitly makes `add_generation_prompt=True` ALSO emit the
 # closed `<think>\n\n</think>\n\n` form, so both renderings share the exact same
 # literal string at the boundary and tokenize identically -- eliminates the mismatch
-# (verified with the real tokenizer). Harmless no-op for chat templates that don't
-# reference `enable_thinking` at all (e.g. Qwen2-VL/Qwen2.5-VL) since Jinja silently
-# ignores unused template variables.
+# (verified with the real tokenizer).
+#
+# Only actually apply it (see `_resolve_chat_template_kwargs` below) when the loaded
+# processor's own chat template references `enable_thinking` at all (Qwen3.x): passing
+# it unconditionally to a template that doesn't (e.g. Qwen2-VL/Qwen2.5-VL) still
+# renders byte-identically (Jinja silently ignores unused template variables), but
+# `transformers`' `apply_chat_template` does its OWN separate check -- via Jinja
+# template introspection (`_get_template_variables`) -- to decide which of its
+# `**kwargs` are "real" template variables vs. mistakenly-misplaced `processor_kwargs`;
+# `enable_thinking` not appearing in that template's variable list makes it match the
+# latter and trips `logger.warning("Kwargs passed to \`processor.__call__\` have to be
+# in \`processor_kwargs\` dict, not in \`**kwargs\`")` on EVERY `apply_chat_template`
+# call (i.e. once per sample, every step) -- purely cosmetic log spam, but avoiding it
+# outright is simplest.
 _CHAT_TEMPLATE_KWARGS: Dict = {"enable_thinking": False}
+
+
+def _resolve_chat_template_kwargs(processor) -> Dict:
+    """Return `_CHAT_TEMPLATE_KWARGS` only if `processor`'s own chat template actually
+    references `enable_thinking` (Qwen3.x "thinking mode" templates); otherwise `{}`.
+    See `_CHAT_TEMPLATE_KWARGS`'s comment above for why this avoids a per-sample
+    `transformers` log-spam warning on models (e.g. Qwen2-VL/Qwen2.5-VL) whose template
+    doesn't use it. Falls back to the unconditional dict if `processor` is `None`
+    (callers that don't have one yet can't detect support either way).
+    """
+    if processor is None:
+        return _CHAT_TEMPLATE_KWARGS
+    template = getattr(processor, "chat_template", None)
+    if isinstance(template, dict):
+        template = "\n".join(v for v in template.values() if isinstance(v, str))
+    if isinstance(template, str) and "enable_thinking" in template:
+        return _CHAT_TEMPLATE_KWARGS
+    return {}
 
 
 def _row_to_trl_sample(
@@ -499,6 +528,7 @@ def _row_to_trl_sample(
     truncate them safely) is simplest and only drops a small minority of rows.
     """
     sample_id = sample.get("id", idx)
+    chat_template_kwargs = _resolve_chat_template_kwargs(processor)
     if text_only:
         prompt, completion = build_messages_text_only(conversations=sample["conversations"])
         if prompt is None:
@@ -506,7 +536,7 @@ def _row_to_trl_sample(
         return {
             "prompt": prompt,
             "completion": completion,
-            "chat_template_kwargs": _CHAT_TEMPLATE_KWARGS,
+            "chat_template_kwargs": chat_template_kwargs,
             "_keep": True,
         }
 
@@ -527,13 +557,13 @@ def _row_to_trl_sample(
     if prompt is None:
         return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
     if images and processor is not None and max_seq_length is not None:
-        if _exceeds_max_length(processor, prompt, completion, images, max_seq_length, _CHAT_TEMPLATE_KWARGS):
+        if _exceeds_max_length(processor, prompt, completion, images, max_seq_length, chat_template_kwargs):
             return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
     return {
         "prompt": prompt,
         "completion": completion,
         "images": images,
-        "chat_template_kwargs": _CHAT_TEMPLATE_KWARGS,
+        "chat_template_kwargs": chat_template_kwargs,
         "_keep": True,
     }
 
