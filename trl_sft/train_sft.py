@@ -131,8 +131,24 @@ def _local_cache_name(s3_or_local_path: str) -> str:
     return name or "model"
 
 
-def download_from_s3(s3_path: str, local_dir: str) -> str:
-    """Download model/dataset from S3 to local disk, skip if already exists."""
+def download_from_s3(s3_path: str, local_dir: str, exclude_checkpoints: bool = False) -> str:
+    """Download model/dataset from S3 to local disk, skip if already exists.
+
+    `exclude_checkpoints=True` skips any `checkpoint-*/` subdirectory. This matters when
+    `s3_path` is a model dir produced by a PREVIOUS run of this script used as the
+    starting point for a later stage (e.g. loading a Stage I output dir to start Stage
+    II): `--output_dir` (and hence the uploaded model dir) contains both the final
+    merged model at the root (config.json/model.safetensors/tokenizer.*, all that
+    `from_pretrained` ever reads) AND every intermediate `--save_steps` checkpoint
+    (each one a full DeepSpeed ZeRO checkpoint with fp32 optimizer state -- for a 9B
+    model that's ~5x the plain model size, PER checkpoint, and `--save_total_limit`
+    keeps up to 5 of them). Downloading those checkpoint dirs alongside the root is
+    pure waste: verified on the real Qwen3.5-9B-stage1-16gpu output (475GB total, only
+    18.8GB of it is the root-level files `from_pretrained` will actually load; the
+    other 456GB is 5 checkpoint-*/ dirs full of *_optim_states.pt / mp_rank_*.pt
+    shards). Harmless / a no-op for base model dirs that don't have any checkpoint-*
+    subdirs in the first place.
+    """
     local_dir = Path(local_dir)
     marker = local_dir / ".download_complete"
 
@@ -142,7 +158,8 @@ def download_from_s3(s3_path: str, local_dir: str) -> str:
 
     local_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Downloading {s3_path} -> {local_dir} ...")
-    ret = os.system(f"aws s3 cp --recursive {s3_path} {local_dir}/")
+    exclude_flag = " --exclude 'checkpoint-*/*'" if exclude_checkpoints else ""
+    ret = os.system(f"aws s3 cp --recursive{exclude_flag} {s3_path} {local_dir}/")
     if ret != 0:
         raise RuntimeError(f"aws s3 cp failed (exit={ret}) for {s3_path} -> {local_dir}")
     marker.touch()
@@ -785,7 +802,7 @@ def debug_dry_run(args):
     cache_dir = args.download_model or f"/tmp/{_local_cache_name(args.model_path)}"
     local_model = args.model_path
     if args.model_path.startswith("s3://"):
-        local_model = download_from_s3(args.model_path.rstrip("/"), cache_dir)
+        local_model = download_from_s3(args.model_path.rstrip("/"), cache_dir, exclude_checkpoints=True)
 
     logger.info("Loading model & processor...")
     processor = AutoProcessor.from_pretrained(local_model, trust_remote_code=True)
@@ -987,7 +1004,7 @@ def main():
     local_model_path = args.model_path
     if args.model_path.startswith("s3://"):
         cache_dir = args.download_model or f"/tmp/{_local_cache_name(args.model_path)}"
-        local_model_path = download_from_s3(args.model_path.rstrip("/"), cache_dir)
+        local_model_path = download_from_s3(args.model_path.rstrip("/"), cache_dir, exclude_checkpoints=True)
 
     # ── load model & processor ──
     logger.info(f"Loading model from {local_model_path} ...")
