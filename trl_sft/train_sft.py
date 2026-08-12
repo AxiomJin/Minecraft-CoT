@@ -106,7 +106,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-from datasets import load_dataset
+from datasets import concatenate_datasets, load_dataset
 from datasets.distributed import split_dataset_by_node
 from PIL import Image
 from transformers import (
@@ -530,6 +530,52 @@ def _default_image_root(data_path: Union[str, List[str]]) -> str:
     return first.rsplit("/", 1)[0]
 
 
+# Columns actually read anywhere downstream (`_row_to_trl_sample` / `build_messages` /
+# `build_messages_qa` / `build_messages_text_only`): the trajectory-id (used only to
+# seed the history-sampling RNG, falls back to the row index if absent), the
+# conversation itself, and the image path list. Everything else (`label`, `model`,
+# `datetime`, `source`, ...) is pure metadata never touched by training code.
+_USED_COLUMNS = {"id", "conversations", "image"}
+
+
+def _load_dataset_multi(builder_name: str, data_path: Union[str, List[str]], streaming: bool):
+    """`load_dataset(builder_name, data_files=data_path, split="train", streaming=...)`,
+    except when `data_path` is a `list` of several files: those are loaded and reduced
+    to `_USED_COLUMNS` ONE FILE AT A TIME, then stitched together with
+    `concatenate_datasets`, instead of a single `load_dataset(..., data_files=[...])`
+    call across every file at once.
+
+    This matters because `minecraft-vlp`'s jsonl files (needed combined for JARVIS-VLA
+    Stage II: VQA + Caption + 3 Grounding files) have wildly different schemas for
+    columns training never uses -- e.g. `source` is `{"image_url": str, "points":
+    [x,y], ...}` in one file, `{"image_urls": [str, ...], "points": [[x,y], ...],
+    "action": str, ...}` in another, and `{"image_url": [str], "points": [{"x":,"y":},
+    ...], "bbox": [{"label":, "bbox": [[[...]]]}]}` in a third; one file even has a
+    typo'd `datatime` key instead of `datetime`. A single combined `load_dataset(...,
+    data_files=[f1, f2, ...])` call makes the streaming JSON reader try to unify ALL
+    files' schemas into one global Arrow schema up front (via HF `datasets`'
+    `_cast_table`/`table_cast`) -- verified this hard-crashes with `TypeError: Couldn't
+    cast array of type struct<...> to struct<...>` as soon as iteration reaches a file
+    whose `source` struct-shape disagrees with the one inferred from an earlier file.
+    Since pyarrow's per-file JSON schema inference never sees more than one file when
+    each is loaded (and trimmed) separately, this side-steps the incompatibility
+    entirely -- verified against the real 5-file Stage II combination (261,461 rows
+    iterated end-to-end with no error, vs. an immediate crash with the naive combined
+    call).
+    """
+    if not isinstance(data_path, list):
+        return load_dataset(builder_name, data_files=data_path, split="train", streaming=streaming)
+
+    per_file = []
+    for path in data_path:
+        ds = load_dataset(builder_name, data_files=path, split="train", streaming=streaming)
+        drop = [c for c in ds.column_names if c not in _USED_COLUMNS]
+        if drop:
+            ds = ds.remove_columns(drop)
+        per_file.append(ds)
+    return concatenate_datasets(per_file)
+
+
 def build_minecraft_dataset(
     data_path: Union[str, List[str]],
     max_turns: int = 4,
@@ -612,7 +658,7 @@ def build_minecraft_dataset(
 
     builder_name = "parquet" if data_format == "parquet" else "json"
     if streaming:
-        dataset = load_dataset(builder_name, data_files=data_path, split="train", streaming=True)
+        dataset = _load_dataset_multi(builder_name, data_path, streaming=True)
         rank = int(os.environ.get("RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
         if world_size > 1:
@@ -620,7 +666,7 @@ def build_minecraft_dataset(
             logger.info(f"Sharded streaming dataset across {world_size} ranks (this rank={rank}).")
         logger.info(f"Dataset loaded in streaming mode (format={data_format}, length unknown ahead of time)")
     else:
-        dataset = load_dataset(builder_name, data_files=data_path, split="train")
+        dataset = _load_dataset_multi(builder_name, data_path, streaming=False)
         logger.info(f"Dataset loaded (format={data_format}): {len(dataset)} samples")
 
     raw_columns = dataset.column_names
