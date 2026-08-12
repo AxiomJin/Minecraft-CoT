@@ -442,6 +442,8 @@ def _row_to_trl_sample(
     data_format: str,
     image_root: Optional[str],
     text_only: bool = False,
+    processor=None,
+    max_seq_length: Optional[int] = None,
 ) -> Dict:
     """
     Map ONE raw dataset row (parquet trajectory step OR jsonl QA session, per
@@ -480,6 +482,21 @@ def _row_to_trl_sample(
     Invalid rows are flagged via `"_keep": False` instead of being dropped here (a
     `.map()` function must return exactly one output row per input row); the caller
     chains `.filter(lambda x: x["_keep"])` afterwards to actually drop them.
+
+    If `processor` and `max_seq_length` are both given, image-bearing samples also get
+    a `_keep=False` pre-filter based on their REAL tokenized length (see
+    `_exceeds_max_length`) -- this guards against a crash that is otherwise silent
+    until it kills a whole multi-GPU job partway through training: `SFTConfig`'s
+    `max_length`/`max_seq_length` truncation happens at the raw-token level with no
+    awareness of where each image's placeholder-token block starts/ends, so an
+    oversized multi-image sample (e.g. `mc-grounding-point-embodied-image5.jsonl`'s
+    5-image rows) can get truncated *through the middle* of an image's placeholder
+    tokens. The VLM's forward pass then finds the (untruncated) vision-tower feature
+    count no longer matches the (truncated) placeholder-token count still in
+    `input_ids` and raises `ValueError: Image features and image tokens do not
+    match, tokens: N, features: M` -- observed in practice for Qwen2-VL-7B on this
+    Stage II data. Filtering the oversized rows out up front (instead of trying to
+    truncate them safely) is simplest and only drops a small minority of rows.
     """
     sample_id = sample.get("id", idx)
     if text_only:
@@ -509,6 +526,9 @@ def _row_to_trl_sample(
         )
     if prompt is None:
         return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
+    if images and processor is not None and max_seq_length is not None:
+        if _exceeds_max_length(processor, prompt, completion, images, max_seq_length, _CHAT_TEMPLATE_KWARGS):
+            return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
     return {
         "prompt": prompt,
         "completion": completion,
@@ -516,6 +536,47 @@ def _row_to_trl_sample(
         "chat_template_kwargs": _CHAT_TEMPLATE_KWARGS,
         "_keep": True,
     }
+
+
+def _exceeds_max_length(
+    processor,
+    prompt: List[Dict],
+    completion: List[Dict],
+    images: List["Image.Image"],
+    max_seq_length: int,
+    chat_template_kwargs: Optional[Dict] = None,
+) -> bool:
+    """Re-tokenize `prompt+completion+images` with the REAL processor (same one used
+    for training) to get the exact token count `SFTTrainer`'s collator would produce,
+    and check whether it overflows `max_seq_length`.
+
+    This exists purely to pre-filter samples that would otherwise crash training (see
+    `_row_to_trl_sample`'s docstring): unlike plain-text overflow (which the collator
+    truncates away harmlessly), an overflowing VLM sample risks the truncation point
+    landing inside an image's placeholder-token block, which crashes the model's
+    forward pass with a tokens/features-count mismatch instead of just losing some
+    trailing context. We therefore treat ANY overflow on an image-bearing sample as
+    unsafe and drop it, rather than trying to reason about whether this particular
+    truncation point happens to fall after the last image (safe) or through one
+    (crash) -- the dropped fraction is small and this is far cheaper than debugging a
+    mid-run multi-GPU crash.
+
+    On any processor error (e.g. a malformed/corrupt image), also returns True
+    (drop defensively) rather than propagating the exception out of a `.map()` call.
+    """
+    try:
+        rendered = processor.apply_chat_template(
+            list(prompt) + list(completion),
+            tokenize=False,
+            add_generation_prompt=False,
+            **(chat_template_kwargs or {}),
+        )
+        encoded = processor(text=[rendered], images=images, return_tensors=None)
+        total_len = len(encoded["input_ids"][0])
+        return total_len > max_seq_length
+    except Exception as e:
+        logger.warning(f"Length pre-check failed for a sample ({e!r}); dropping it defensively.")
+        return True
 
 
 def _detect_data_format(data_path: Union[str, List[str]]) -> str:
@@ -601,6 +662,8 @@ def build_minecraft_dataset(
     data_format: str = "auto",
     image_root: Optional[str] = None,
     text_only: bool = False,
+    processor=None,
+    max_seq_length: Optional[int] = None,
 ):
     """
     Build the Minecraft SFT dataset as a genuine `datasets.Dataset` (`streaming=False`)
@@ -658,6 +721,16 @@ def build_minecraft_dataset(
     random-access (`__getitem__`/`__len__`) is supported as usual for `datasets.Dataset`;
     when `streaming=True` (the default for large S3 datasets), only iteration is
     supported -- `len()` is undefined, matching `datasets.IterableDataset` semantics.
+
+    `processor`/`max_seq_length`: when both are given, image-bearing samples whose REAL
+    tokenized length (computed with this exact `processor`) would overflow
+    `max_seq_length` are dropped instead of silently truncated -- see
+    `_row_to_trl_sample`/`_exceeds_max_length` for why blind token-level truncation is
+    unsafe for VLM samples (it can crash training by cutting through an image's
+    placeholder-token block). Pass the same `AutoProcessor` instance used to build
+    `training_args`/the model so the token counts match exactly. Omit both (the
+    default) to skip this check entirely -- e.g. for Stage I `--text_only` data, which
+    has no images and thus no risk of this specific crash.
     """
     if data_format == "auto":
         data_format = _detect_data_format(data_path)
@@ -696,6 +769,8 @@ def build_minecraft_dataset(
             "data_format": data_format,
             "image_root": image_root,
             "text_only": text_only,
+            "processor": processor,
+            "max_seq_length": max_seq_length,
         },
         remove_columns=raw_columns,
     )
@@ -824,6 +899,8 @@ def debug_dry_run(args):
         data_format=args.data_format,
         image_root=args.image_root,
         text_only=args.text_only,
+        processor=processor,
+        max_seq_length=args.max_seq_length,
     )
 
     sft_config_field_names = {f.name for f in dataclass_fields(SFTConfig)}
@@ -1033,6 +1110,11 @@ def main():
         data_format=args.data_format,
         image_root=args.image_root,
         text_only=args.text_only,
+        # Pre-filter oversized multi-image samples using the REAL processor/max_length
+        # about to be used for training -- see `_row_to_trl_sample`/`_exceeds_max_length`.
+        # `text_only` samples have no images so this is a no-op for Stage I regardless.
+        processor=processor,
+        max_seq_length=args.max_seq_length,
     )
 
     # ── training config ──
