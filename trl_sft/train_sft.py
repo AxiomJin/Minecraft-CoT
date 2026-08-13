@@ -299,6 +299,33 @@ def _split_prompt_completion_with_images(
     # Split off the final assistant turn as the `completion`; everything before it
     # becomes the `prompt` (context that `completion_only_loss` will mask out).
     prompt, completion = messages[:-1], [messages[-1]]
+
+    # Defensive invariant check: TRL's collator (`trl.data_utils.prepare_multimodal_messages`,
+    # called on `example["prompt"]`/`example["images"]` inside `SFTTrainer`'s
+    # `torch_call`) requires the number of `{"type": "image"}` placeholders WITHIN
+    # `prompt` to exactly equal `len(images)` (the flat image list accumulated above
+    # across the WHOLE conversation, prompt- and completion-side alike) -- otherwise it
+    # raises `ValueError: Number of images provided (N) does not match number of image
+    # placeholders (M)`. Observed in practice: this crashed two separate live 16-GPU
+    # Stage II jobs ~13h in, once a `DataLoader` worker's shuffled iteration order
+    # finally landed on the one bad row out of hundreds of thousands. Root cause is a
+    # small minority of mislabeled rows in the underlying jsonl data where an image
+    # placeholder ends up in the FINAL (assistant) turn -- which becomes `completion`,
+    # not `prompt` -- so that image's matching placeholder is invisible to `prompt`'s
+    # count even though `images` (built across the whole conversation) still includes
+    # it. Checking this invariant up front, at dataset-construction time, converts a
+    # "crash the whole distributed job hours into training" failure into a "silently
+    # drop this one malformed row" outcome instead.
+    num_prompt_placeholders = sum(
+        1 for m in prompt for item in m["content"] if item.get("type") == "image"
+    )
+    if num_prompt_placeholders != len(images):
+        logger.warning(
+            f"Dropping a sample where prompt-side image placeholders ({num_prompt_placeholders}) "
+            f"!= total images ({len(images)}) -- likely an image placeholder landed in the final "
+            f"(completion) turn. See this function's docstring/comment for why this is unsafe."
+        )
+        return None, None, []
     return prompt, completion, images
 
 
