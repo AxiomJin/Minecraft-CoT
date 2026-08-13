@@ -956,6 +956,152 @@ def freeze_vision_tower(model: torch.nn.Module) -> None:
     )
 
 
+# ─── resilient collator wrapper ────────────────────────────────────────────────
+
+_IMAGE_PLACEHOLDER_MISMATCH_MSG = "does not match number of image placeholders"
+
+
+class _SafeVisionCollatorWrapper:
+    """Wraps `SFTTrainer`'s real (`DataCollatorForVisionLanguageModeling`) collator to
+    survive `ValueError: Number of images provided (N) does not match number of image
+    placeholders (M)` (raised by `trl.data_utils.prepare_multimodal_messages`, called
+    from `_collate_prompt_completion`) WITHOUT crashing the whole multi-GPU job.
+
+    ROOT CAUSE (confirmed by direct reproduction against the real TRL collator, NOT
+    theoretical): `prepare_multimodal_messages` REASSIGNS `example["prompt"]`/
+    `example["completion"]` to a brand-new, "filled-in" structure (placeholders like
+    `{"type": "image"}` become `{"type": "image", "image": <PIL.Image>}`) every time an
+    example is collated. If the SAME example dict is EVER collated a second time (e.g.
+    a duplicate row served twice by a buggy dataset/dataloader interaction -- an
+    exhaustive scan of every one of the ~261k rows in the real Stage II jsonl data,
+    using this exact `_row_to_trl_sample`/`build_messages_qa` code path unmodified,
+    found ZERO rows that could themselves produce a mismatch, ruling out "a bad data
+    row" as the cause), the second collation finds 0 unfilled placeholders (they're
+    already filled) but `images` is unchanged (still length N), and raises this exact
+    error. `_collate_prompt_completion` also processes a batch's examples in a plain
+    `for` loop, so if example k (0-indexed) is the one that's being double-collated,
+    every example BEFORE k in that same call has ALREADY been (successfully, harmlessly)
+    re-mutated by the time the exception propagates -- this wrapper must undo that
+    partial mutation before it can safely retry, or its own retries would spuriously
+    "fail" on perfectly fine examples.
+
+    Mutation is undone CHEAPLY (no deep-copying of image pixel data): since
+    `prepare_multimodal_messages` never mutates the nested message/content dicts in
+    place -- it only builds new ones and reassigns the top-level
+    `example["prompt"]`/`example["completion"]` references -- simply saving those two
+    references before calling the inner collator and restoring them on failure fully
+    reverts an example to its pre-call state.
+
+    Recovery strategy once reverted:
+      1. Retry each example in the batch ALONE (batch of 1) to find out whether the
+         error reproduces for an individual example in isolation, or only for the
+         combination.
+      2. Drop every example that fails alone; if none do (the failure only manifests
+         for some combination), iteratively drop the last remaining example and retry
+         until it succeeds or only one is left.
+      3. If even a single-example batch still fails, give up and re-raise the original
+         exception -- this is meant as a mitigation for a rare event, not an
+         infinite-retry loop that could mask an unrelated, systemic bug.
+    Any other exception (or a `ValueError` with a different message) is never touched
+    and propagates immediately, unchanged.
+    """
+
+    def __init__(self, inner_collator):
+        self.inner_collator = inner_collator
+
+    def __call__(self, examples):
+        result, error = self._try_collate(examples)
+        if error is None:
+            return result
+        logger.warning(
+            f"Caught '{error}' from the vision-language collator on a batch of "
+            f"{len(examples)} examples -- attempting to drop the offending "
+            "example(s) and continue instead of crashing the job. See "
+            "`_SafeVisionCollatorWrapper`'s docstring for why this is needed."
+        )
+        return self._retry_dropping_bad_examples(examples, error)
+
+    def _try_collate(self, examples):
+        """Calls the inner collator, saving + restoring each example's top-level
+        "prompt"/"completion" references so that ANY partial mutation from a failed
+        attempt (see class docstring for why plain reference restoration is sufficient)
+        is fully undone before returning -- regardless of success or failure. Returns
+        `(result, None)` on success, or `(None, the_exception)` if it's the specific
+        image-placeholder-mismatch `ValueError` this class handles (any OTHER exception
+        propagates immediately, unchanged)."""
+        prompt_snapshot = [ex.get("prompt") for ex in examples]
+        completion_snapshot = [ex.get("completion") for ex in examples]
+        try:
+            return self.inner_collator(examples), None
+        except ValueError as e:
+            if _IMAGE_PLACEHOLDER_MISMATCH_MSG not in str(e):
+                raise
+            for ex, p, c in zip(examples, prompt_snapshot, completion_snapshot):
+                ex["prompt"] = p
+                ex["completion"] = c
+            return None, e
+
+    def _probe_single(self, ex):
+        """Check whether a single example, ALONE, would raise the mismatch error --
+        WITHOUT leaving any side effect on `ex` either way. This matters even for a
+        SUCCESSFUL probe: `prepare_multimodal_messages` reassigns `ex["prompt"]` to a
+        "filled" state on success too (see class docstring), which would silently turn
+        `ex` into a ticking time bomb for the real retry call right after this probing
+        loop -- reusing an already-"filled" `ex` a second time is exactly the confirmed
+        root cause this whole class exists to guard against. Restoring after ANY
+        outcome keeps every example pristine until the one real (non-probing)
+        collation attempt that actually produces the returned batch."""
+        prompt_snapshot = ex.get("prompt")
+        completion_snapshot = ex.get("completion")
+        try:
+            self.inner_collator([ex])
+            bad = False
+        except ValueError as e:
+            if _IMAGE_PLACEHOLDER_MISMATCH_MSG not in str(e):
+                raise
+            bad = True
+        ex["prompt"] = prompt_snapshot
+        ex["completion"] = completion_snapshot
+        return bad
+
+    def _retry_dropping_bad_examples(self, examples, original_error):
+        bad_indices = {i for i, ex in enumerate(examples) if self._probe_single(ex)}
+
+        if bad_indices:
+            logger.warning(f"Dropping {len(bad_indices)} example(s) at batch indices {sorted(bad_indices)}.")
+            remaining = [ex for i, ex in enumerate(examples) if i not in bad_indices]
+        else:
+            # The error only reproduces for the combination, not any single example in
+            # isolation -- fall through to the iterative shrink below instead.
+            logger.warning(
+                "No single example reproduced the error in isolation (likely a "
+                "cross-example interaction); shrinking the batch from the end until it "
+                "succeeds."
+            )
+            remaining = list(examples)
+
+        # Iteratively drop the last remaining example and retry, in case a single drop
+        # isn't enough -- bounded by `len(examples)` iterations, so this always
+        # terminates (worst case: empty batch -> re-raise below).
+        while remaining:
+            result, err = self._try_collate(remaining)
+            if err is None:
+                return result
+            if len(remaining) == 1:
+                break
+            logger.warning(
+                f"Retry with {len(remaining)} example(s) still hit the same error; "
+                "dropping one more (the last) and retrying."
+            )
+            remaining = remaining[:-1]
+
+        logger.error(
+            "Could not produce a valid batch even after dropping example(s) down to "
+            f"{len(remaining)} remaining; re-raising the original error."
+        )
+        raise original_error
+
+
 # ─── debug / dry-run helpers ──────────────────────────────────────────────────
 
 
@@ -1043,6 +1189,12 @@ def debug_dry_run(args):
         train_dataset=dataset,
         processing_class=processor,
     )
+    if not args.text_only:
+        # Only the vision-language collator can hit the image-placeholder-mismatch
+        # error this wrapper guards against; Stage I (--text_only) has no "images" key
+        # at all and uses the plain-text collator instead, so wrapping it is a no-op
+        # that would only add pointless overhead.
+        trainer.data_collator = _SafeVisionCollatorWrapper(trainer.data_collator)
 
     logger.info("Running trainer.train() for max_steps=2...")
     trainer.train()
@@ -1348,6 +1500,16 @@ def main():
         train_dataset=dataset,
         processing_class=processor,
     )
+    if not args.text_only:
+        # See `_SafeVisionCollatorWrapper`'s docstring: this guards against
+        # `ValueError: Number of images provided (N) does not match number of image
+        # placeholders (M)` crashing the whole distributed job. Observed in practice on
+        # a real 16-GPU Stage II run even though an exhaustive scan of every row in the
+        # actual jsonl data (using this exact unmodified code path) found zero rows
+        # that could produce this mismatch -- so the dataset-construction-time
+        # defensive check in `_split_prompt_completion_with_images` alone was not
+        # sufficient; this adds a second, training-loop-level layer of defense.
+        trainer.data_collator = _SafeVisionCollatorWrapper(trainer.data_collator)
 
     trainer.train()
     trainer.save_model()
