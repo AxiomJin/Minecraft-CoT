@@ -41,7 +41,7 @@ MASTER_PORT="${MASTER_PORT:-29400}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        train|debug|preflight) MODE="$1"; shift ;;
+        train|debug) MODE="$1"; shift ;;
         --mode) MODE="$2"; shift 2 ;;
         --nproc) NPROC="$2"; shift 2 ;;
         --nnodes) NNODES="$2"; shift 2 ;;
@@ -62,7 +62,6 @@ PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-2}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-4}"
 MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-16384}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-2}"
-PREFLIGHT_REPORT="${PREFLIGHT_REPORT:-./stage2-preflight-report.json}"
 STAGE2_TRAIN_SAMPLES="${STAGE2_TRAIN_SAMPLES:-261461}"
 TOTAL_GPUS=$((NNODES * NPROC))
 MAX_STEPS="${MAX_STEPS:-$((STAGE2_TRAIN_SAMPLES / (PER_DEVICE_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * TOTAL_GPUS)))}"
@@ -125,23 +124,6 @@ localize_stage2_jsonl_and_images() {
 }
 
 case "$MODE" in
-    preflight)
-        echo "=== Running Stage II data preflight ==="
-        # Deliberately reads directly from S3 (NOT localized): preflight's purpose is
-        # to validate the authoritative source data itself, independent of any local
-        # caching step.
-        if ! python3 -c "import s3fs"; then
-            echo "Missing s3fs: install trl_sft/requirements.txt before reading S3 Stage II data." >&2
-            exit 1
-        fi
-        python3 train_sft.py \
-            --model_path "$MODEL_PATH" \
-            --data_path "$DATA_PATH" \
-            --data_format jsonl \
-            --image_root "$IMAGE_ROOT" \
-            --preflight \
-            --preflight_report "$PREFLIGHT_REPORT"
-        ;;
     debug)
         echo "=== Running DEBUG dry-run ==="
         localize_stage2_jsonl_and_images
@@ -190,7 +172,7 @@ case "$MODE" in
                 --logging_steps 10
         ;;
     *)
-        echo "Usage: bash launch.sh [preflight|debug|train]"
+        echo "Usage: bash launch.sh [debug|train]"
         exit 1
         ;;
 esac

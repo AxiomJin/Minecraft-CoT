@@ -99,8 +99,6 @@ import argparse
 import io
 import json
 import logging
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 import os
 import random
 import sys
@@ -108,30 +106,15 @@ from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
-try:
-    import torch
-    from datasets import concatenate_datasets, load_dataset
-    from datasets.distributed import split_dataset_by_node
-    from transformers import AutoModelForImageTextToText, AutoProcessor, set_seed
-    from trl import SFTConfig, SFTTrainer
-except ImportError:
-    # The full training stack is deliberately optional for `--preflight`: it only
-    # needs Pillow plus fsspec/s3fs to validate raw Stage II records and images.
-    torch = None
-    concatenate_datasets = load_dataset = split_dataset_by_node = None
-    AutoModelForImageTextToText = AutoProcessor = set_seed = SFTConfig = SFTTrainer = None
-
+import torch
+from datasets import concatenate_datasets, load_dataset
+from datasets.distributed import split_dataset_by_node
+from transformers import AutoModelForImageTextToText, AutoProcessor, set_seed
+from trl import SFTConfig, SFTTrainer
 from PIL import Image
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-
-def _require_training_dependencies() -> None:
-    if torch is None or SFTConfig is None or SFTTrainer is None:
-        raise RuntimeError(
-            "The training stack is unavailable. Install trl_sft/requirements.txt before using --debug or training; "
-            "--preflight only requires Pillow, fsspec, and s3fs."
-        )
 logger = logging.getLogger(__name__)
 
 
@@ -899,216 +882,6 @@ def build_minecraft_dataset(
     return dataset
 
 
-# ─── Stage II data preflight ───────────────────────────────────────────────────
-
-
-def _validate_image_uri(uri: str) -> Optional[str]:
-    """Return an error description when a referenced image cannot be decoded."""
-    try:
-        with Image.open(io.BytesIO(_read_bytes(uri))) as image:
-            image.convert("RGB").load()
-    except Exception as error:
-        return f"{type(error).__name__}: {error}"
-    return None
-
-
-def _write_preflight_report(report_path: str, report: Dict) -> None:
-    path = Path(report_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
-    with open(temporary_path, "w", encoding="utf-8") as report_file:
-        json.dump(report, report_file, ensure_ascii=False, indent=2, sort_keys=True)
-        report_file.write("\n")
-    temporary_path.replace(path)
-
-
-def _iter_jsonl_rows(file_path: str):
-    """Yield physical line number, parsed row, and any JSON decode error independently."""
-    import fsspec
-
-    with fsspec.open(file_path, "rt", encoding="utf-8") as jsonl_file:
-        for line_number, raw_line in enumerate(jsonl_file, start=1):
-            if not raw_line.strip():
-                continue
-            try:
-                yield line_number, json.loads(raw_line), None
-            except json.JSONDecodeError as error:
-                yield line_number, None, error
-
-
-def run_stage2_preflight(args) -> bool:
-    """Fully validate Stage II JSONL rows and referenced images without loading a model.
-
-    Files are streamed independently so the known, incompatible metadata schemas in the
-    five minecraft-vlp shards never need to be unified. The checks mirror the training
-    path's prompt/completion split but are deliberately strict: a missing/corrupt image
-    is reported as an error instead of being silently converted to ``[image]``.
-    """
-    data_format = _detect_data_format(args.data_path) if args.data_format == "auto" else args.data_format
-    if data_format != "jsonl" or args.text_only:
-        raise ValueError("--preflight currently validates image-bearing Stage II JSONL data; use --data_format jsonl without --text_only.")
-
-    paths = args.data_path if isinstance(args.data_path, list) else [args.data_path]
-    image_root = args.image_root or _default_image_root(paths)
-    report_path = args.preflight_report
-    max_errors = args.preflight_max_errors
-    image_workers = max(1, args.preflight_image_workers)
-    report = {
-        "status": "running",
-        "data_format": data_format,
-        "image_root": image_root,
-        "input_files": paths,
-        "max_recorded_errors": max_errors,
-        "image_workers": image_workers,
-        "totals": {"rows": 0, "images": 0, "errors": 0, "warnings": 0, "non_unique_ids": 0},
-        "files": {},
-        "errors": [],
-        "warnings": [],
-    }
-    seen_ids = set()
-    image_executor = ThreadPoolExecutor(max_workers=image_workers, thread_name_prefix="preflight-image")
-
-    def record_error(file_path: str, line_number: int, sample_id, reason: str, detail: str = "") -> None:
-        report["totals"]["errors"] += 1
-        file_report = report["files"][file_path]
-        file_report["errors"][reason] += 1
-        if len(report["errors"]) < max_errors:
-            report["errors"].append(
-                {"file": file_path, "line": line_number, "id": str(sample_id), "reason": reason, "detail": detail}
-            )
-
-    def record_warning(file_path: str, line_number: int, sample_id, reason: str, detail: str = "") -> None:
-        report["totals"]["warnings"] += 1
-        file_report = report["files"][file_path]
-        file_report["warnings"][reason] += 1
-        if len(report["warnings"]) < max_errors:
-            report["warnings"].append(
-                {"file": file_path, "line": line_number, "id": str(sample_id), "reason": reason, "detail": detail}
-            )
-
-    def flush_pending_images(pending_images: List[Tuple[str, str, int, object]]) -> None:
-        image_errors = image_executor.map(_validate_image_uri, (entry[0] for entry in pending_images))
-        for (uri, file_path, line_number, sample_id), image_error in zip(pending_images, image_errors):
-            if image_error is not None:
-                record_error(file_path, line_number, sample_id, "image_decode_failed", f"{uri}: {image_error}")
-
-    for file_path in paths:
-        file_report = {"rows": 0, "images": 0, "errors": Counter(), "warnings": Counter()}
-        report["files"][file_path] = file_report
-        pending_images: List[Tuple[str, str, int, object]] = []
-        for line_number, row, json_error in _iter_jsonl_rows(file_path):
-            if json_error is not None:
-                record_error(file_path, line_number, f"{file_path}:{line_number}", "invalid_json", str(json_error))
-                continue
-            report["totals"]["rows"] += 1
-            file_report["rows"] += 1
-            sample_id = row.get("id", f"{file_path}:{line_number}") if isinstance(row, dict) else f"{file_path}:{line_number}"
-            if not isinstance(row, dict):
-                record_error(file_path, line_number, sample_id, "row_not_object")
-                continue
-
-            if sample_id in seen_ids:
-                # Grounding shards deliberately reuse a trajectory/frame ID for multiple
-                # distinct targets. It is not a sample primary key, so retain this as an
-                # audit warning rather than declaring the multimodal data invalid.
-                report["totals"]["non_unique_ids"] += 1
-                record_warning(file_path, line_number, sample_id, "non_unique_id")
-            else:
-                seen_ids.add(sample_id)
-
-            conversations = row.get("conversations")
-            image_paths = row.get("image", [])
-            if not isinstance(conversations, list) or not conversations:
-                record_error(file_path, line_number, sample_id, "invalid_conversations")
-                continue
-            if not isinstance(image_paths, list):
-                record_error(file_path, line_number, sample_id, "image_field_not_list", type(image_paths).__name__)
-                continue
-
-            if not all(isinstance(turn, dict) and isinstance(turn.get("role"), str) for turn in conversations):
-                record_error(file_path, line_number, sample_id, "invalid_turn_structure")
-                continue
-            normalized_conversations = conversations[1:] if conversations[0]["role"] != "user" else conversations
-            if len(normalized_conversations) < 2 or normalized_conversations[-1]["role"] != "assistant":
-                record_error(file_path, line_number, sample_id, "invalid_turn_order")
-                continue
-
-            placeholder_count = 0
-            completion_placeholder_count = 0
-            malformed_content = False
-            for turn_index, turn in enumerate(normalized_conversations):
-                content = turn.get("content") if isinstance(turn, dict) else None
-                if not isinstance(content, list):
-                    malformed_content = True
-                    break
-                for item in content:
-                    if not isinstance(item, dict):
-                        malformed_content = True
-                        break
-                    item_type = item.get("type")
-                    if item_type == "image":
-                        placeholder_count += 1
-                        if turn_index == len(normalized_conversations) - 1:
-                            completion_placeholder_count += 1
-                    elif item_type == "text" and not isinstance(item.get("text", ""), str):
-                        malformed_content = True
-                        break
-                if malformed_content:
-                    break
-            if malformed_content:
-                record_error(file_path, line_number, sample_id, "malformed_content")
-                continue
-            if placeholder_count != len(image_paths):
-                record_error(
-                    file_path,
-                    line_number,
-                    sample_id,
-                    "image_placeholder_path_mismatch",
-                    f"placeholders={placeholder_count}, image_paths={len(image_paths)}",
-                )
-            if completion_placeholder_count:
-                record_error(
-                    file_path,
-                    line_number,
-                    sample_id,
-                    "image_in_completion",
-                    f"completion_image_placeholders={completion_placeholder_count}",
-                )
-
-            for relative_path in image_paths:
-                if not isinstance(relative_path, str) or not relative_path or relative_path.startswith(("s3://", "http://", "https://")):
-                    record_error(file_path, line_number, sample_id, "invalid_image_path", repr(relative_path))
-                    continue
-                uri = f"{image_root.rstrip('/')}/{relative_path.lstrip('/')}"
-                pending_images.append((uri, file_path, line_number, sample_id))
-                report["totals"]["images"] += 1
-                file_report["images"] += 1
-
-            if len(pending_images) >= image_workers * 16:
-                flush_pending_images(pending_images)
-                pending_images.clear()
-            if line_number % 1000 == 0:
-                logger.info(
-                    "Preflight %s: %d rows, %d images, %d errors",
-                    file_path,
-                    line_number,
-                    file_report["images"],
-                    sum(file_report["errors"].values()),
-                )
-                _write_preflight_report(report_path, report)
-
-        flush_pending_images(pending_images)
-        file_report["errors"] = dict(sorted(file_report["errors"].items()))
-        file_report["warnings"] = dict(sorted(file_report["warnings"].items()))
-        _write_preflight_report(report_path, report)
-
-    image_executor.shutdown(wait=True)
-    report["status"] = "passed" if report["totals"]["errors"] == 0 else "failed"
-    _write_preflight_report(report_path, report)
-    logger.info("Stage II preflight %s: %d rows, %d images, %d errors. Report: %s", report["status"], report["totals"]["rows"], report["totals"]["images"], report["totals"]["errors"], report_path)
-    return report["status"] == "passed"
-
-
 # ─── model helpers ─────────────────────────────────────────────────────────────
 
 # Substrings matched (case-insensitively) against each submodule's own leaf name (not
@@ -1508,30 +1281,6 @@ def main():
         default=2,
         help="Number of optimizer steps for --debug (default: 2).",
     )
-    parser.add_argument(
-        "--preflight",
-        action="store_true",
-        help="Stream every Stage II JSONL row and validate conversation structure, image placeholders, S3 paths, "
-        "image decoding, and duplicate IDs without loading the model.",
-    )
-    parser.add_argument(
-        "--preflight_report",
-        type=str,
-        default="./stage2-preflight-report.json",
-        help="Path to the JSON report written periodically and at the end of --preflight.",
-    )
-    parser.add_argument(
-        "--preflight_max_errors",
-        type=int,
-        default=200,
-        help="Maximum individual error examples retained in the --preflight JSON report.",
-    )
-    parser.add_argument(
-        "--preflight_image_workers",
-        type=int,
-        default=16,
-        help="Concurrent S3 image read/decode workers for --preflight (default: 16).",
-    )
     parser.add_argument("--download_model", type=str, default=None, help="Local dir to cache downloaded model")
     parser.add_argument("--attn_implementation", type=str, default="flash_attention_2")
     # NOTE: TRL's SFTTrainer raises ValueError for packing=True on vision-language
@@ -1558,11 +1307,7 @@ def main():
             "Qwen3.5-VL are all VLMs here). Remove --packing."
         )
 
-    # ── full Stage II data preflight ──
-    if args.preflight:
-        sys.exit(0 if run_stage2_preflight(args) else 2)
-
-    _require_training_dependencies()
+    # ── seed ──
     set_seed(args.seed)
 
     # ── debug mode ──
