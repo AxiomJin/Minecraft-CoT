@@ -93,11 +93,14 @@ NOTE on VLM + TRL:
     on the target "Action: ..." turn, never on the system prompt / history / image tokens.
 """
 
+from __future__ import annotations
+
 import argparse
 import io
 import json
 import logging
-import math
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 import os
 import random
 import sys
@@ -105,20 +108,30 @@ from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
-import torch
-from datasets import concatenate_datasets, load_dataset
-from datasets.distributed import split_dataset_by_node
+try:
+    import torch
+    from datasets import concatenate_datasets, load_dataset
+    from datasets.distributed import split_dataset_by_node
+    from transformers import AutoModelForImageTextToText, AutoProcessor, set_seed
+    from trl import SFTConfig, SFTTrainer
+except ImportError:
+    # The full training stack is deliberately optional for `--preflight`: it only
+    # needs Pillow plus fsspec/s3fs to validate raw Stage II records and images.
+    torch = None
+    concatenate_datasets = load_dataset = split_dataset_by_node = None
+    AutoModelForImageTextToText = AutoProcessor = set_seed = SFTConfig = SFTTrainer = None
+
 from PIL import Image
-from transformers import (
-    AutoConfig,
-    AutoModelForImageTextToText,
-    AutoProcessor,
-    HfArgumentParser,
-    set_seed,
-)
-from trl import SFTConfig, SFTTrainer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+
+def _require_training_dependencies() -> None:
+    if torch is None or SFTConfig is None or SFTTrainer is None:
+        raise RuntimeError(
+            "The training stack is unavailable. Install trl_sft/requirements.txt before using --debug or training; "
+            "--preflight only requires Pillow, fsspec, and s3fs."
+        )
 logger = logging.getLogger(__name__)
 
 
@@ -886,6 +899,216 @@ def build_minecraft_dataset(
     return dataset
 
 
+# ─── Stage II data preflight ───────────────────────────────────────────────────
+
+
+def _validate_image_uri(uri: str) -> Optional[str]:
+    """Return an error description when a referenced image cannot be decoded."""
+    try:
+        with Image.open(io.BytesIO(_read_bytes(uri))) as image:
+            image.convert("RGB").load()
+    except Exception as error:
+        return f"{type(error).__name__}: {error}"
+    return None
+
+
+def _write_preflight_report(report_path: str, report: Dict) -> None:
+    path = Path(report_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
+    with open(temporary_path, "w", encoding="utf-8") as report_file:
+        json.dump(report, report_file, ensure_ascii=False, indent=2, sort_keys=True)
+        report_file.write("\n")
+    temporary_path.replace(path)
+
+
+def _iter_jsonl_rows(file_path: str):
+    """Yield physical line number, parsed row, and any JSON decode error independently."""
+    import fsspec
+
+    with fsspec.open(file_path, "rt", encoding="utf-8") as jsonl_file:
+        for line_number, raw_line in enumerate(jsonl_file, start=1):
+            if not raw_line.strip():
+                continue
+            try:
+                yield line_number, json.loads(raw_line), None
+            except json.JSONDecodeError as error:
+                yield line_number, None, error
+
+
+def run_stage2_preflight(args) -> bool:
+    """Fully validate Stage II JSONL rows and referenced images without loading a model.
+
+    Files are streamed independently so the known, incompatible metadata schemas in the
+    five minecraft-vlp shards never need to be unified. The checks mirror the training
+    path's prompt/completion split but are deliberately strict: a missing/corrupt image
+    is reported as an error instead of being silently converted to ``[image]``.
+    """
+    data_format = _detect_data_format(args.data_path) if args.data_format == "auto" else args.data_format
+    if data_format != "jsonl" or args.text_only:
+        raise ValueError("--preflight currently validates image-bearing Stage II JSONL data; use --data_format jsonl without --text_only.")
+
+    paths = args.data_path if isinstance(args.data_path, list) else [args.data_path]
+    image_root = args.image_root or _default_image_root(paths)
+    report_path = args.preflight_report
+    max_errors = args.preflight_max_errors
+    image_workers = max(1, args.preflight_image_workers)
+    report = {
+        "status": "running",
+        "data_format": data_format,
+        "image_root": image_root,
+        "input_files": paths,
+        "max_recorded_errors": max_errors,
+        "image_workers": image_workers,
+        "totals": {"rows": 0, "images": 0, "errors": 0, "warnings": 0, "non_unique_ids": 0},
+        "files": {},
+        "errors": [],
+        "warnings": [],
+    }
+    seen_ids = set()
+    image_executor = ThreadPoolExecutor(max_workers=image_workers, thread_name_prefix="preflight-image")
+
+    def record_error(file_path: str, line_number: int, sample_id, reason: str, detail: str = "") -> None:
+        report["totals"]["errors"] += 1
+        file_report = report["files"][file_path]
+        file_report["errors"][reason] += 1
+        if len(report["errors"]) < max_errors:
+            report["errors"].append(
+                {"file": file_path, "line": line_number, "id": str(sample_id), "reason": reason, "detail": detail}
+            )
+
+    def record_warning(file_path: str, line_number: int, sample_id, reason: str, detail: str = "") -> None:
+        report["totals"]["warnings"] += 1
+        file_report = report["files"][file_path]
+        file_report["warnings"][reason] += 1
+        if len(report["warnings"]) < max_errors:
+            report["warnings"].append(
+                {"file": file_path, "line": line_number, "id": str(sample_id), "reason": reason, "detail": detail}
+            )
+
+    def flush_pending_images(pending_images: List[Tuple[str, str, int, object]]) -> None:
+        image_errors = image_executor.map(_validate_image_uri, (entry[0] for entry in pending_images))
+        for (uri, file_path, line_number, sample_id), image_error in zip(pending_images, image_errors):
+            if image_error is not None:
+                record_error(file_path, line_number, sample_id, "image_decode_failed", f"{uri}: {image_error}")
+
+    for file_path in paths:
+        file_report = {"rows": 0, "images": 0, "errors": Counter(), "warnings": Counter()}
+        report["files"][file_path] = file_report
+        pending_images: List[Tuple[str, str, int, object]] = []
+        for line_number, row, json_error in _iter_jsonl_rows(file_path):
+            if json_error is not None:
+                record_error(file_path, line_number, f"{file_path}:{line_number}", "invalid_json", str(json_error))
+                continue
+            report["totals"]["rows"] += 1
+            file_report["rows"] += 1
+            sample_id = row.get("id", f"{file_path}:{line_number}") if isinstance(row, dict) else f"{file_path}:{line_number}"
+            if not isinstance(row, dict):
+                record_error(file_path, line_number, sample_id, "row_not_object")
+                continue
+
+            if sample_id in seen_ids:
+                # Grounding shards deliberately reuse a trajectory/frame ID for multiple
+                # distinct targets. It is not a sample primary key, so retain this as an
+                # audit warning rather than declaring the multimodal data invalid.
+                report["totals"]["non_unique_ids"] += 1
+                record_warning(file_path, line_number, sample_id, "non_unique_id")
+            else:
+                seen_ids.add(sample_id)
+
+            conversations = row.get("conversations")
+            image_paths = row.get("image", [])
+            if not isinstance(conversations, list) or not conversations:
+                record_error(file_path, line_number, sample_id, "invalid_conversations")
+                continue
+            if not isinstance(image_paths, list):
+                record_error(file_path, line_number, sample_id, "image_field_not_list", type(image_paths).__name__)
+                continue
+
+            if not all(isinstance(turn, dict) and isinstance(turn.get("role"), str) for turn in conversations):
+                record_error(file_path, line_number, sample_id, "invalid_turn_structure")
+                continue
+            normalized_conversations = conversations[1:] if conversations[0]["role"] != "user" else conversations
+            if len(normalized_conversations) < 2 or normalized_conversations[-1]["role"] != "assistant":
+                record_error(file_path, line_number, sample_id, "invalid_turn_order")
+                continue
+
+            placeholder_count = 0
+            completion_placeholder_count = 0
+            malformed_content = False
+            for turn_index, turn in enumerate(normalized_conversations):
+                content = turn.get("content") if isinstance(turn, dict) else None
+                if not isinstance(content, list):
+                    malformed_content = True
+                    break
+                for item in content:
+                    if not isinstance(item, dict):
+                        malformed_content = True
+                        break
+                    item_type = item.get("type")
+                    if item_type == "image":
+                        placeholder_count += 1
+                        if turn_index == len(normalized_conversations) - 1:
+                            completion_placeholder_count += 1
+                    elif item_type == "text" and not isinstance(item.get("text", ""), str):
+                        malformed_content = True
+                        break
+                if malformed_content:
+                    break
+            if malformed_content:
+                record_error(file_path, line_number, sample_id, "malformed_content")
+                continue
+            if placeholder_count != len(image_paths):
+                record_error(
+                    file_path,
+                    line_number,
+                    sample_id,
+                    "image_placeholder_path_mismatch",
+                    f"placeholders={placeholder_count}, image_paths={len(image_paths)}",
+                )
+            if completion_placeholder_count:
+                record_error(
+                    file_path,
+                    line_number,
+                    sample_id,
+                    "image_in_completion",
+                    f"completion_image_placeholders={completion_placeholder_count}",
+                )
+
+            for relative_path in image_paths:
+                if not isinstance(relative_path, str) or not relative_path or relative_path.startswith(("s3://", "http://", "https://")):
+                    record_error(file_path, line_number, sample_id, "invalid_image_path", repr(relative_path))
+                    continue
+                uri = f"{image_root.rstrip('/')}/{relative_path.lstrip('/')}"
+                pending_images.append((uri, file_path, line_number, sample_id))
+                report["totals"]["images"] += 1
+                file_report["images"] += 1
+
+            if len(pending_images) >= image_workers * 16:
+                flush_pending_images(pending_images)
+                pending_images.clear()
+            if line_number % 1000 == 0:
+                logger.info(
+                    "Preflight %s: %d rows, %d images, %d errors",
+                    file_path,
+                    line_number,
+                    file_report["images"],
+                    sum(file_report["errors"].values()),
+                )
+                _write_preflight_report(report_path, report)
+
+        flush_pending_images(pending_images)
+        file_report["errors"] = dict(sorted(file_report["errors"].items()))
+        file_report["warnings"] = dict(sorted(file_report["warnings"].items()))
+        _write_preflight_report(report_path, report)
+
+    image_executor.shutdown(wait=True)
+    report["status"] = "passed" if report["totals"]["errors"] == 0 else "failed"
+    _write_preflight_report(report_path, report)
+    logger.info("Stage II preflight %s: %d rows, %d images, %d errors. Report: %s", report["status"], report["totals"]["rows"], report["totals"]["images"], report["totals"]["errors"], report_path)
+    return report["status"] == "passed"
+
+
 # ─── model helpers ─────────────────────────────────────────────────────────────
 
 # Substrings matched (case-insensitively) against each submodule's own leaf name (not
@@ -956,150 +1179,51 @@ def freeze_vision_tower(model: torch.nn.Module) -> None:
     )
 
 
-# ─── resilient collator wrapper ────────────────────────────────────────────────
-
-_IMAGE_PLACEHOLDER_MISMATCH_MSG = "does not match number of image placeholders"
+# ─── immutable VLM collator adapter ───────────────────────────────────────────
 
 
-class _SafeVisionCollatorWrapper:
-    """Wraps `SFTTrainer`'s real (`DataCollatorForVisionLanguageModeling`) collator to
-    survive `ValueError: Number of images provided (N) does not match number of image
-    placeholders (M)` (raised by `trl.data_utils.prepare_multimodal_messages`, called
-    from `_collate_prompt_completion`) WITHOUT crashing the whole multi-GPU job.
+def _clone_conversation(messages):
+    """Clone mutable chat containers while retaining immutable/PIL payload references."""
+    if not isinstance(messages, list):
+        return messages
+    cloned_messages = []
+    for message in messages:
+        if not isinstance(message, dict):
+            cloned_messages.append(message)
+            continue
+        cloned_message = dict(message)
+        content = message.get("content")
+        if isinstance(content, list):
+            cloned_message["content"] = [dict(item) if isinstance(item, dict) else item for item in content]
+        cloned_messages.append(cloned_message)
+    return cloned_messages
 
-    ROOT CAUSE (confirmed by direct reproduction against the real TRL collator, NOT
-    theoretical): `prepare_multimodal_messages` REASSIGNS `example["prompt"]`/
-    `example["completion"]` to a brand-new, "filled-in" structure (placeholders like
-    `{"type": "image"}` become `{"type": "image", "image": <PIL.Image>}`) every time an
-    example is collated. If the SAME example dict is EVER collated a second time (e.g.
-    a duplicate row served twice by a buggy dataset/dataloader interaction -- an
-    exhaustive scan of every one of the ~261k rows in the real Stage II jsonl data,
-    using this exact `_row_to_trl_sample`/`build_messages_qa` code path unmodified,
-    found ZERO rows that could themselves produce a mismatch, ruling out "a bad data
-    row" as the cause), the second collation finds 0 unfilled placeholders (they're
-    already filled) but `images` is unchanged (still length N), and raises this exact
-    error. `_collate_prompt_completion` also processes a batch's examples in a plain
-    `for` loop, so if example k (0-indexed) is the one that's being double-collated,
-    every example BEFORE k in that same call has ALREADY been (successfully, harmlessly)
-    re-mutated by the time the exception propagates -- this wrapper must undo that
-    partial mutation before it can safely retry, or its own retries would spuriously
-    "fail" on perfectly fine examples.
 
-    Mutation is undone CHEAPLY (no deep-copying of image pixel data): since
-    `prepare_multimodal_messages` never mutates the nested message/content dicts in
-    place -- it only builds new ones and reassigns the top-level
-    `example["prompt"]`/`example["completion"]` references -- simply saving those two
-    references before calling the inner collator and restoring them on failure fully
-    reverts an example to its pre-call state.
+class _ImmutableVisionCollatorAdapter:
+    """Give TRL's mutating VLM collator disposable sample containers.
 
-    Recovery strategy once reverted:
-      1. Retry each example in the batch ALONE (batch of 1) to find out whether the
-         error reproduces for an individual example in isolation, or only for the
-         combination.
-      2. Drop every example that fails alone; if none do (the failure only manifests
-         for some combination), iteratively drop the last remaining example and retry
-         until it succeeds or only one is left.
-      3. If even a single-example batch still fails, give up and re-raise the original
-         exception -- this is meant as a mitigation for a rare event, not an
-         infinite-retry loop that could mask an unrelated, systemic bug.
-    Any other exception (or a `ValueError` with a different message) is never touched
-    and propagates immediately, unchanged.
+    `DataCollatorForVisionLanguageModeling` injects decoded images into prompt content
+    and writes the resulting messages back to the supplied example dict. Dataset rows
+    must remain pristine because an iterable/dataloader may hand the same Python object
+    to the collator again. This adapter copies only the mutable dict/list structure;
+    decoded PIL images remain shared references, so it does not duplicate pixel memory.
+    It intentionally does not catch or alter collator exceptions.
     """
 
     def __init__(self, inner_collator):
         self.inner_collator = inner_collator
 
     def __call__(self, examples):
-        result, error = self._try_collate(examples)
-        if error is None:
-            return result
-        logger.warning(
-            f"Caught '{error}' from the vision-language collator on a batch of "
-            f"{len(examples)} examples -- attempting to drop the offending "
-            "example(s) and continue instead of crashing the job. See "
-            "`_SafeVisionCollatorWrapper`'s docstring for why this is needed."
-        )
-        return self._retry_dropping_bad_examples(examples, error)
-
-    def _try_collate(self, examples):
-        """Calls the inner collator, saving + restoring each example's top-level
-        "prompt"/"completion" references so that ANY partial mutation from a failed
-        attempt (see class docstring for why plain reference restoration is sufficient)
-        is fully undone before returning -- regardless of success or failure. Returns
-        `(result, None)` on success, or `(None, the_exception)` if it's the specific
-        image-placeholder-mismatch `ValueError` this class handles (any OTHER exception
-        propagates immediately, unchanged)."""
-        prompt_snapshot = [ex.get("prompt") for ex in examples]
-        completion_snapshot = [ex.get("completion") for ex in examples]
-        try:
-            return self.inner_collator(examples), None
-        except ValueError as e:
-            if _IMAGE_PLACEHOLDER_MISMATCH_MSG not in str(e):
-                raise
-            for ex, p, c in zip(examples, prompt_snapshot, completion_snapshot):
-                ex["prompt"] = p
-                ex["completion"] = c
-            return None, e
-
-    def _probe_single(self, ex):
-        """Check whether a single example, ALONE, would raise the mismatch error --
-        WITHOUT leaving any side effect on `ex` either way. This matters even for a
-        SUCCESSFUL probe: `prepare_multimodal_messages` reassigns `ex["prompt"]` to a
-        "filled" state on success too (see class docstring), which would silently turn
-        `ex` into a ticking time bomb for the real retry call right after this probing
-        loop -- reusing an already-"filled" `ex` a second time is exactly the confirmed
-        root cause this whole class exists to guard against. Restoring after ANY
-        outcome keeps every example pristine until the one real (non-probing)
-        collation attempt that actually produces the returned batch."""
-        prompt_snapshot = ex.get("prompt")
-        completion_snapshot = ex.get("completion")
-        try:
-            self.inner_collator([ex])
-            bad = False
-        except ValueError as e:
-            if _IMAGE_PLACEHOLDER_MISMATCH_MSG not in str(e):
-                raise
-            bad = True
-        ex["prompt"] = prompt_snapshot
-        ex["completion"] = completion_snapshot
-        return bad
-
-    def _retry_dropping_bad_examples(self, examples, original_error):
-        bad_indices = {i for i, ex in enumerate(examples) if self._probe_single(ex)}
-
-        if bad_indices:
-            logger.warning(f"Dropping {len(bad_indices)} example(s) at batch indices {sorted(bad_indices)}.")
-            remaining = [ex for i, ex in enumerate(examples) if i not in bad_indices]
-        else:
-            # The error only reproduces for the combination, not any single example in
-            # isolation -- fall through to the iterative shrink below instead.
-            logger.warning(
-                "No single example reproduced the error in isolation (likely a "
-                "cross-example interaction); shrinking the batch from the end until it "
-                "succeeds."
-            )
-            remaining = list(examples)
-
-        # Iteratively drop the last remaining example and retry, in case a single drop
-        # isn't enough -- bounded by `len(examples)` iterations, so this always
-        # terminates (worst case: empty batch -> re-raise below).
-        while remaining:
-            result, err = self._try_collate(remaining)
-            if err is None:
-                return result
-            if len(remaining) == 1:
-                break
-            logger.warning(
-                f"Retry with {len(remaining)} example(s) still hit the same error; "
-                "dropping one more (the last) and retrying."
-            )
-            remaining = remaining[:-1]
-
-        logger.error(
-            "Could not produce a valid batch even after dropping example(s) down to "
-            f"{len(remaining)} remaining; re-raising the original error."
-        )
-        raise original_error
+        working_examples = []
+        for example in examples:
+            working = dict(example)
+            for field in ("messages", "prompt", "completion"):
+                if field in working:
+                    working[field] = _clone_conversation(working[field])
+            if isinstance(working.get("images"), list):
+                working["images"] = list(working["images"])
+            working_examples.append(working)
+        return self.inner_collator(working_examples)
 
 
 # ─── debug / dry-run helpers ──────────────────────────────────────────────────
@@ -1116,8 +1240,9 @@ def debug_dry_run(args):
          `torch.utils.data.IterableDataset` raises `TypeError` at trainer-construction
          time; a manual `processor(...)`/collator-only test would never hit that code
          path at all).
-      3. Construct a real `SFTTrainer` with a tiny `SFTConfig` (`max_steps=2`, no
-         checkpoint saving, no external logging) and call `.train()` -- this exercises
+      3. Construct a real `SFTTrainer` with a bounded `SFTConfig` (controlled by
+      `--debug_steps`, no checkpoint saving, no external logging) and call `.train()` -- this exercises
+
          dataset iteration, the vision-language collator, forward, backward, and an
          optimizer step through the *exact* same trainer code real training uses.
     """
@@ -1166,14 +1291,16 @@ def debug_dry_run(args):
     debug_output_dir = os.path.join(args.output_dir, "_debug_dry_run")
     training_args = SFTConfig(
         output_dir=debug_output_dir,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=1,
-        max_steps=2,
+        per_device_train_batch_size=args.per_device_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        max_steps=args.debug_steps,
         learning_rate=args.learning_rate,
         bf16=True,
+        gradient_checkpointing=args.gradient_checkpointing,
         logging_steps=1,
         save_strategy="no",
-        dataloader_num_workers=0,
+        dataloader_num_workers=args.dataloader_num_workers,
+        deepspeed=args.deepspeed,
         remove_unused_columns=False,
         packing=False,
         completion_only_loss=True,
@@ -1189,19 +1316,66 @@ def debug_dry_run(args):
         train_dataset=dataset,
         processing_class=processor,
     )
-    if not args.text_only:
-        # Only the vision-language collator can hit the image-placeholder-mismatch
-        # error this wrapper guards against; Stage I (--text_only) has no "images" key
-        # at all and uses the plain-text collator instead, so wrapping it is a no-op
-        # that would only add pointless overhead.
-        trainer.data_collator = _SafeVisionCollatorWrapper(trainer.data_collator)
-
-    logger.info("Running trainer.train() for max_steps=2...")
+    trainer.data_collator = _ImmutableVisionCollatorAdapter(trainer.data_collator)
+    logger.info(f"Running trainer.train() for max_steps={args.debug_steps} with immutable VLM collator inputs...")
     trainer.train()
-    logger.info("=== DRY RUN PASSED (SFTTrainer built + trained for 2 steps successfully) ===")
+    logger.info(f"=== DRY RUN PASSED (SFTTrainer built + trained for {args.debug_steps} steps successfully) ===")
 
 
 # ─── main training ────────────────────────────────────────────────────────────
+
+
+def _is_complete_trainer_checkpoint(checkpoint: str) -> bool:
+    """Return whether a Trainer checkpoint has its completion state and model artifact."""
+    trainer_state_path = os.path.join(checkpoint, "trainer_state.json")
+    if not os.path.isfile(trainer_state_path) or os.path.getsize(trainer_state_path) == 0:
+        return False
+    try:
+        with open(trainer_state_path, "r", encoding="utf-8") as state_file:
+            json.load(state_file)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    model_artifacts = (
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+        "adapter_model.safetensors",
+        "adapter_model.bin",
+    )
+    return any(os.path.isfile(os.path.join(checkpoint, artifact)) for artifact in model_artifacts)
+
+
+def _resolve_resume_checkpoint(requested: Optional[str], output_dir: str) -> Optional[str]:
+    """Resolve an explicit checkpoint path or the latest complete checkpoint in ``output_dir``."""
+    if requested in (None, "none"):
+        return None
+
+    if requested == "auto":
+        candidates = []
+        if os.path.isdir(output_dir):
+            for entry in os.scandir(output_dir):
+                if entry.is_dir() and entry.name.startswith("checkpoint-"):
+                    try:
+                        step = int(entry.name.removeprefix("checkpoint-"))
+                    except ValueError:
+                        continue
+                    candidates.append((step, entry.path))
+        for _, checkpoint in sorted(candidates, reverse=True):
+            if _is_complete_trainer_checkpoint(checkpoint):
+                logger.info(f"Resuming exact Trainer state from checkpoint: {checkpoint}")
+                return checkpoint
+            logger.warning(f"Skipping incomplete checkpoint: {checkpoint}")
+        logger.warning("--resume_from_checkpoint=auto found no complete checkpoint; starting a new run.")
+        return None
+
+    if not os.path.isdir(requested):
+        raise ValueError(f"Resume checkpoint does not exist or is not a directory: {requested}")
+    if not _is_complete_trainer_checkpoint(requested):
+        raise ValueError(f"Resume checkpoint is incomplete: {requested}")
+    logger.info(f"Resuming exact Trainer state from checkpoint: {requested}")
+    return requested
 
 
 def main():
@@ -1251,6 +1425,14 @@ def main():
         "--text_only.",
     )
     parser.add_argument("--output_dir", type=str, default="./output")
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default="auto",
+        help="Checkpoint directory to resume exactly (model, optimizer, scheduler and RNG). "
+        "'auto' (default) resumes the latest complete checkpoint-* in --output_dir; "
+        "use 'none' to force a new run.",
+    )
     parser.add_argument("--max_turns", type=int, default=4, help="Max (user,assistant) pairs per sample")
     parser.add_argument("--max_seq_length", type=int, default=16384)
     parser.add_argument("--per_device_batch_size", type=int, default=2)
@@ -1317,8 +1499,38 @@ def main():
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Dry-run: build the real dataset, construct a real SFTTrainer, train for "
-        "max_steps=2, exit (no checkpoint saved).",
+        help="GPU smoke/stress run: build the real dataset, construct a real SFTTrainer, train for "
+        "--debug_steps, then exit without saving a checkpoint or final model.",
+    )
+    parser.add_argument(
+        "--debug_steps",
+        type=int,
+        default=2,
+        help="Number of optimizer steps for --debug (default: 2).",
+    )
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Stream every Stage II JSONL row and validate conversation structure, image placeholders, S3 paths, "
+        "image decoding, and duplicate IDs without loading the model.",
+    )
+    parser.add_argument(
+        "--preflight_report",
+        type=str,
+        default="./stage2-preflight-report.json",
+        help="Path to the JSON report written periodically and at the end of --preflight.",
+    )
+    parser.add_argument(
+        "--preflight_max_errors",
+        type=int,
+        default=200,
+        help="Maximum individual error examples retained in the --preflight JSON report.",
+    )
+    parser.add_argument(
+        "--preflight_image_workers",
+        type=int,
+        default=16,
+        help="Concurrent S3 image read/decode workers for --preflight (default: 16).",
     )
     parser.add_argument("--download_model", type=str, default=None, help="Local dir to cache downloaded model")
     parser.add_argument("--attn_implementation", type=str, default="flash_attention_2")
@@ -1346,12 +1558,19 @@ def main():
             "Qwen3.5-VL are all VLMs here). Remove --packing."
         )
 
+    # ── full Stage II data preflight ──
+    if args.preflight:
+        sys.exit(0 if run_stage2_preflight(args) else 2)
+
+    _require_training_dependencies()
     set_seed(args.seed)
 
     # ── debug mode ──
     if args.debug:
         debug_dry_run(args)
         sys.exit(0)
+
+    resume_from_checkpoint = _resolve_resume_checkpoint(args.resume_from_checkpoint, args.output_dir)
 
     # ── download model ──
     local_model_path = args.model_path
@@ -1501,17 +1720,8 @@ def main():
         processing_class=processor,
     )
     if not args.text_only:
-        # See `_SafeVisionCollatorWrapper`'s docstring: this guards against
-        # `ValueError: Number of images provided (N) does not match number of image
-        # placeholders (M)` crashing the whole distributed job. Observed in practice on
-        # a real 16-GPU Stage II run even though an exhaustive scan of every row in the
-        # actual jsonl data (using this exact unmodified code path) found zero rows
-        # that could produce this mismatch -- so the dataset-construction-time
-        # defensive check in `_split_prompt_completion_with_images` alone was not
-        # sufficient; this adds a second, training-loop-level layer of defense.
-        trainer.data_collator = _SafeVisionCollatorWrapper(trainer.data_collator)
-
-    trainer.train()
+        trainer.data_collator = _ImmutableVisionCollatorAdapter(trainer.data_collator)
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     trainer.save_model()
     processor.save_pretrained(args.output_dir)
 
