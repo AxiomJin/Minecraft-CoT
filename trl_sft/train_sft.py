@@ -653,8 +653,12 @@ def _row_to_trl_sample(
     count no longer matches the (truncated) placeholder-token count still in
     `input_ids` and raises `ValueError: Image features and image tokens do not
     match, tokens: N, features: M` -- observed in practice for Qwen2-VL-7B on this
-    Stage II data. Filtering the oversized rows out up front (instead of trying to
-    truncate them safely) is simplest and only drops a small minority of rows.
+    Stage II data.
+
+    For trajectory (parquet) rows the overflow is resolved by *trimming the sampled
+    history* until the sample fits, keeping one output sample per input row. Dropping
+    such rows instead is what previously hung multi-node training -- see the long
+    comment at the trimming loop for the full mechanism.
     """
     sample_id = sample.get("id", idx)
     chat_template_kwargs = _resolve_chat_template_kwargs(processor)
@@ -675,19 +679,64 @@ def _row_to_trl_sample(
             image_paths=sample.get("image", []),
             image_root=image_root,
         )
-    else:
-        rng = random.Random(f"{seed}-{sample_id}")
-        prompt, completion, images = build_messages(
-            conversations=sample["conversations"],
-            image_bytes_list=sample.get("image_bytes", []),
-            max_turns=max_turns,
-            rng=rng,
-        )
-    if prompt is None:
-        return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
-    if images and processor is not None and max_seq_length is not None:
-        if _exceeds_max_length(processor, prompt, completion, images, max_seq_length, chat_template_kwargs):
+        if prompt is None:
             return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
+        if images and processor is not None and max_seq_length is not None:
+            if _exceeds_max_length(processor, prompt, completion, images, max_seq_length, chat_template_kwargs):
+                return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
+    else:
+        def _build(turns: int):
+            # Fresh rng per attempt so the drawn history length stays a pure function of
+            # (seed, sample_id, turns) -- i.e. identical on every rank, never dependent on
+            # how many attempts happened to run.
+            return build_messages(
+                conversations=sample["conversations"],
+                image_bytes_list=sample.get("image_bytes", []),
+                max_turns=turns,
+                rng=random.Random(f"{seed}-{sample_id}"),
+            )
+
+        prompt, completion, images = _build(max_turns)
+        if prompt is None:
+            return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
+
+        # Shrink the sampled history (dropping the OLDEST turns, and with them their
+        # images) until the sample fits, instead of discarding the row outright.
+        #
+        # Dropping rows here is what deadlocked multi-node training: `.filter()` removes a
+        # *data-dependent, therefore rank-dependent* number of rows from each rank's shard
+        # of the streaming dataset, so ranks stop yielding batches at different steps, run
+        # different numbers of micro-batches within one gradient-accumulation window, and
+        # end up issuing mismatched NCCL collectives -- some ranks still in
+        # `SFTTrainer.compute_loss`'s metrics all-gather while others have already reached
+        # the ZeRO optimizer's 1-element overflow all-reduce. That mismatch hangs every
+        # rank until the 600s watchdog aborts the job (no Python-level error, which is why
+        # it presented only as `Watchdog caught collective operation timeout`).
+        #
+        # Keeping this map 1:1 (one input row -> one training sample) makes every rank's
+        # stream exactly the same length, so the ranks cannot drift apart. It also recovers
+        # long-trajectory samples that used to be thrown away: only the surplus history is
+        # trimmed, never the current step or its target action.
+        if images and processor is not None and max_seq_length is not None:
+            turns = max_turns
+            while _exceeds_max_length(
+                processor, prompt, completion, images, max_seq_length, chat_template_kwargs
+            ):
+                if turns <= 0:
+                    # Even a single turn (current observation + its action) overflows, so
+                    # there is nothing left to trim -- drop as a last resort. Vanishingly
+                    # rare (one 640x360 frame is ~300 vision tokens), and unlike the
+                    # length-based dropping above it is not correlated with trajectory
+                    # length, so it does not systematically favour any particular rank.
+                    logger.warning(
+                        f"Sample {sample_id} exceeds max_seq_length={max_seq_length} even with a "
+                        "single turn; dropping it."
+                    )
+                    return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
+                turns -= 1
+                prompt, completion, images = _build(turns)
+                if prompt is None:
+                    return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
     return {
         "prompt": prompt,
         "completion": completion,
