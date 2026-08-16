@@ -56,6 +56,7 @@ MODEL_PATH="${MODEL_PATH:-s3://arcwm-code-us-west-2/axiom/model/Qwen3.5-9B-stage
 DATA_PATH="${DATA_PATH:-s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp/mc-vqa-241102.jsonl,s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp/mc-caption-241104.jsonl,s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp/mc-grounding-point-embodied-image5.jsonl,s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp/mc-grounding-point-embodied.jsonl,s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp/mc-grounding-point-gui.jsonl}"
 IMAGE_ROOT="${IMAGE_ROOT:-s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp}"
 LOCAL_DATA_ROOT="${LOCAL_DATA_ROOT:-/local-ssd/minecraft-vlp}"
+LOCAL_PARQUET_ROOT="${LOCAL_PARQUET_ROOT:-/local-ssd/minecraft-text-action}"
 OUTPUT_DIR="${OUTPUT_DIR:-./stage2-qwen35-9b}"
 DOWNLOAD_CACHE="${DOWNLOAD_CACHE:-/tmp/qwen35_9b_stage1_cache}"
 PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-2}"
@@ -121,6 +122,38 @@ localize_stage2_jsonl_and_images() {
     IMAGE_ROOT="$LOCAL_DATA_ROOT"
     echo "[localize] Done. DATA_PATH=$DATA_PATH IMAGE_ROOT=$IMAGE_ROOT" >&2
     echo "[localize] Local image count: $(find "$LOCAL_DATA_ROOT" -type f ! -name '*.jsonl' | wc -l)" >&2
+}
+
+# Pre-download `minecraft-text-action-dataset`'s parquet shards (Stage III: action
+# post-training) onto local SSD, then repoint `$DATA_PATH` at the local glob -- same
+# rationale as `localize_stage2_jsonl_and_images` above (avoid every DataLoader worker
+# on every rank streaming parquet row-groups LIVE from S3 for the whole run). No
+# separate image sync is needed here: each parquet row already embeds its own
+# `image_bytes` column, unlike Stage II's jsonl+external-images layout. Must run
+# independently on EACH node (local SSD is node-local). No-op if `$DATA_PATH` is
+# already local. Expects `$DATA_PATH` to be a SINGLE glob (e.g.
+# "s3://.../minecraft-text-action-dataset/data/train-*.parquet"), not a
+# comma-separated list.
+localize_stage3_parquet_dataset() {
+    if [[ "$DATA_PATH" != s3://* ]]; then
+        echo "[localize] DATA_PATH is already local, skipping." >&2
+        return
+    fi
+
+    local s3_dir="${DATA_PATH%/*}/"       # e.g. "s3://.../data/train-*.parquet" -> "s3://.../data/"
+    local glob_name="$(basename "$DATA_PATH")"  # e.g. "train-*.parquet"
+    mkdir -p "$LOCAL_PARQUET_ROOT"
+    echo "[localize] Syncing parquet shards from $s3_dir to $LOCAL_PARQUET_ROOT ..." >&2
+    if command -v s5cmd >/dev/null 2>&1; then
+        s5cmd sync --include "*.parquet" "${s3_dir}*" "$LOCAL_PARQUET_ROOT/"
+    else
+        aws s3 sync "$s3_dir" "$LOCAL_PARQUET_ROOT/" --exclude "*" --include "*.parquet" --only-show-errors
+    fi
+
+    DATA_PATH="$LOCAL_PARQUET_ROOT/$glob_name"
+    echo "[localize] Done. DATA_PATH=$DATA_PATH" >&2
+    # shellcheck disable=SC2086
+    echo "[localize] Local parquet shard count: $(ls -1 $LOCAL_PARQUET_ROOT/*.parquet 2>/dev/null | wc -l)" >&2
 }
 
 case "$MODE" in
