@@ -1,5 +1,0 @@
-train:
-  rmpad: false
-  rmpad_with_pos_ids: false
-  dyn_bsz: false
-  freeze_vit: false
