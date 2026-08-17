@@ -112,7 +112,6 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from datasets import concatenate_datasets, load_dataset
-from datasets.distributed import split_dataset_by_node
 from transformers import AutoModelForImageTextToText, AutoProcessor, TrainerCallback, set_seed
 from trl import SFTConfig, SFTTrainer
 from PIL import Image
@@ -615,17 +614,15 @@ def _row_to_trl_sample(
     a custom `torch.utils.data.IterableDataset` iterates fine on its own but is
     rejected with `TypeError` at trainer-construction time. Chaining `.map()` on the
     object returned by `datasets.load_dataset(...)` keeps the result a genuine
-    `datasets.Dataset` / `datasets.IterableDataset`, so it passes that check while all
-    the sharding/streaming machinery documented in `build_minecraft_dataset` still
-    applies unchanged.
+    `datasets.Dataset` / `datasets.IterableDataset`, so it passes that check and
+    remains shardable by SFTTrainer/Accelerate at DataLoader preparation time.
 
     For `data_format == "parquet"` (`minecraft-text-action-dataset`-style trajectory
     rows), uses a *local* RNG keyed by the sample's own stable "id" (not `idx`, the
-    stream-position/row index) so that (a) different ranks/workers never happen to
-    reuse the same seed for "the k-th sample they each see locally" -- which they
-    otherwise would, since after sharding every rank/worker's local stream position
-    resets to 0 -- and (b) we don't mutate the global `random` module state as a side
-    effect. For `data_format == "jsonl"` (`minecraft-vlp`-style flat QA rows,
+    stream-position/row index) so that (a) process/worker sharding cannot change a
+    sample's history choice merely by resetting a local stream position to 0 and
+    (b) we don't mutate the global `random` module state as a side effect. For
+    `data_format == "jsonl"` (`minecraft-vlp`-style flat QA rows,
     `build_messages_qa`) there is no history sampling, so no RNG is needed.
 
     If `text_only=True` (Stage I, see `--text_only`), this bypasses `build_messages`/
@@ -656,9 +653,9 @@ def _row_to_trl_sample(
     Stage II data.
 
     For trajectory (parquet) rows the overflow is resolved by *trimming the sampled
-    history* until the sample fits, keeping one output sample per input row. Dropping
-    such rows instead is what previously hung multi-node training -- see the long
-    comment at the trimming loop for the full mechanism.
+    history* until the sample fits. This preserves one output sample per input row in
+    the normal path, minimizing differences in effective shard lengths after
+    Accelerate performs the one and only process-level split.
     """
     sample_id = sample.get("id", idx)
     chat_template_kwargs = _resolve_chat_template_kwargs(processor)
@@ -701,22 +698,20 @@ def _row_to_trl_sample(
             return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
 
         # Shrink the sampled history (dropping the OLDEST turns, and with them their
-        # images) until the sample fits, instead of discarding the row outright.
-        #
-        # Dropping rows here is what deadlocked multi-node training: `.filter()` removes a
-        # *data-dependent, therefore rank-dependent* number of rows from each rank's shard
-        # of the streaming dataset, so ranks stop yielding batches at different steps, run
-        # different numbers of micro-batches within one gradient-accumulation window, and
-        # end up issuing mismatched NCCL collectives -- some ranks still in
-        # `SFTTrainer.compute_loss`'s metrics all-gather while others have already reached
-        # the ZeRO optimizer's 1-element overflow all-reduce. That mismatch hangs every
-        # rank until the 600s watchdog aborts the job (no Python-level error, which is why
-        # it presented only as `Watchdog caught collective operation timeout`).
-        #
-        # Keeping this map 1:1 (one input row -> one training sample) makes every rank's
-        # stream exactly the same length, so the ranks cannot drift apart. It also recovers
-        # long-trajectory samples that used to be thrown away: only the surplus history is
+        # images) until the sample fits, instead of discarding the row outright. This
+        # keeps the common parquet path 1:1 (one input row -> one training sample),
+        # reduces rank-to-rank differences in effective shard lengths, and recovers
+        # long-trajectory samples that used to be thrown away: only surplus history is
         # trimmed, never the current step or its target action.
+        #
+        # This is complementary to, but distinct from, process sharding. The dataset
+        # returned by `build_minecraft_dataset` must remain UNSHARDED here; SFTTrainer /
+        # Accelerate performs process-level sharding exactly once when preparing the
+        # DataLoader. Manually calling `split_dataset_by_node` before that caused every
+        # rank's stream to be divided by world_size a second time (N/world_size^2), which
+        # was the actual cause of the deterministic step-53/105 exhaustion and mismatched
+        # NCCL collectives. Rare malformed or irreducibly oversized rows may still be
+        # filtered, so callers should keep a small margin below the theoretical epoch end.
         if images and processor is not None and max_seq_length is not None:
             turns = max_turns
             while _exceeds_max_length(
@@ -961,14 +956,17 @@ def build_minecraft_dataset(
     IMPORTANT: this returns the result of chaining `.map()` / `.filter()` /
     `.remove_columns()` directly on `datasets.load_dataset(...)`'s return value -- NOT a
     hand-rolled `torch.utils.data.IterableDataset` subclass. `trl.SFTTrainer` requires
-    `train_dataset` to be a `datasets.Dataset` / `datasets.IterableDataset` instance (it
+    `train_dataset` to be a     `datasets.Dataset` / `datasets.IterableDataset` instance (it
     raises `TypeError` otherwise at trainer-construction time, even though a custom torch
     `IterableDataset` would iterate correctly on its own -- this bug is what this function
     replaces). Chaining `.map()`/`.filter()` on the loaded dataset keeps the returned
     object a real `datasets`-library type while preserving all sharding behavior:
-      - Cross-rank sharding uses `datasets.distributed.split_dataset_by_node`, applied
-        *before* `.map()`, so each rank only streams/transforms its own shards
-        (instead of every rank pulling the full dataset over the network).
+      - This function deliberately returns the FULL, UNSHARDED dataset. SFTTrainer sets
+        `dispatch_batches=False` for a HF IterableDataset, and Trainer subsequently calls
+        `Accelerator.prepare(DataLoader)`, where Accelerate performs the one and only
+        process-level shard (`dataset.shard(...)` or `IterableDatasetShard`). Do NOT call
+        `split_dataset_by_node` here: doing so divides each process stream by world_size a
+        second time, causing deterministic early exhaustion and mismatched collectives.
       - Cross-worker sharding (when `dataloader_num_workers > 0`) needs no extra code:
         `.map()`/`.filter()` on an `IterableDataset` just wrap the underlying shard
         iterator rather than replacing it with a single unshardable generator, so
@@ -1007,12 +1005,13 @@ def build_minecraft_dataset(
     builder_name = "parquet" if data_format == "parquet" else "json"
     if streaming:
         dataset = _load_dataset_multi(builder_name, data_path, streaming=True)
-        rank = int(os.environ.get("RANK", 0))
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
-        if world_size > 1:
-            dataset = split_dataset_by_node(dataset, rank=rank, world_size=world_size)
-            logger.info(f"Sharded streaming dataset across {world_size} ranks (this rank={rank}).")
-        logger.info(f"Dataset loaded in streaming mode (format={data_format}, length unknown ahead of time)")
+        # Return the complete HF IterableDataset. SFTTrainer/Accelerate shards it once
+        # while preparing the DataLoader. Pre-sharding here caused double sharding:
+        # N/world_size^2 samples per process and deterministic early stream exhaustion.
+        logger.info(
+            f"Dataset loaded in streaming mode (format={data_format}, length unknown ahead of time); "
+            "process sharding is delegated to SFTTrainer/Accelerate"
+        )
     else:
         dataset = _load_dataset_multi(builder_name, data_path, streaming=False)
         logger.info(f"Dataset loaded (format={data_format}): {len(dataset)} samples")
@@ -1169,10 +1168,14 @@ def debug_dry_run(args):
          time; a manual `processor(...)`/collator-only test would never hit that code
          path at all).
       3. Construct a real `SFTTrainer` with a bounded `SFTConfig` (controlled by
-      `--debug_steps`, no checkpoint saving, no external logging) and call `.train()` -- this exercises
+         `--debug_steps`, no checkpoint saving, no external logging) and call `.train()`.
+         This exercises dataset iteration, the vision-language collator, forward,
+         backward, and an optimizer step through the same trainer code real training uses.
 
-         dataset iteration, the vision-language collator, forward, backward, and an
-         optimizer step through the *exact* same trainer code real training uses.
+    This helper is normally launched as a single Python process, so it does NOT validate
+    multi-process sharding by itself. Distributed sharding must be checked under torchrun;
+    in production the unsharded HF IterableDataset returned above is split exactly once by
+    SFTTrainer/Accelerate during DataLoader preparation.
     """
     logger.info("=== DEBUG DRY RUN ===")
     logger.info(f"Model: {args.model_path}")
@@ -1508,10 +1511,13 @@ def main():
 
     # ── load dataset ──
     # For large S3 datasets, use streaming to avoid downloading everything.
-    # `build_minecraft_dataset` returns a genuine `datasets.IterableDataset` (built via
-    # `.map()`/`.filter()` chained on `datasets.load_dataset(...)`), which is required
-    # for `SFTTrainer` -- a hand-rolled `torch.utils.data.IterableDataset` subclass is
-    # rejected with `TypeError` at trainer-construction time.
+    # `build_minecraft_dataset` returns the complete, UNSHARDED genuine
+    # `datasets.IterableDataset` (built via `.map()`/`.filter()` chained on
+    # `datasets.load_dataset(...)`). SFTTrainer/Accelerate must be the only owner of
+    # process-level sharding when it prepares the DataLoader; pre-sharding here would
+    # silently divide the stream by world_size twice. A hand-rolled
+    # `torch.utils.data.IterableDataset` subclass is also rejected by SFTTrainer with
+    # `TypeError` at trainer-construction time.
     dataset = build_minecraft_dataset(
         data_path=args.data_path,
         max_turns=args.max_turns,
