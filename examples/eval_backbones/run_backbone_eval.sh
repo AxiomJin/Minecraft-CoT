@@ -108,14 +108,41 @@ if ! conda env list | grep -qE "^openha "; then
     conda create -n openha python=3.10 -y
 fi
 conda activate openha
+# openjdk 是 MineStudio/Malmo 模拟器启动 Minecraft 进程必需的（xvfb-run 里跑
+# `java ...`），独立于 torch/vllm/minestudio 这几个 python 包检查——不能把它塞进
+# 下面那个 if 块里：koala 节点会跨 job 复用同一个持久化 conda env，如果这个 env
+# 是被"某次 openjdk 安装碰巧失败/被跳过"的历史 job 创建的，torch/vllm/minestudio
+# 三个包已经装好会导致下面的 if 判定为假、直接跳过，openjdk 就永远不会被补装，
+# 之后每次 rollout 都会在模拟器启动阶段炸 `java: not found`（实测于 koala job
+# axiomjin-eval-qwen25vl-mini-normal-20260818-175020，torch/vllm/minestudio 都已
+# 装好，只有 java 缺失）。所以放到 if 外面，每次都独立检查+装。
+if ! command -v java >/dev/null 2>&1; then
+    echo "[setup] installing openjdk=8 (required by MineStudio/Malmo simulator launcher)"
+    conda install --channel=conda-forge openjdk=8 -y -q
+fi
 # 注意：不能用 `import openagents` 判断是否已装好——cwd(=REPO_ROOT)下就有 openagents/
 # 源码目录，`python -c` 默认把cwd 加入 sys.path，即使没pip install 也能import 到，
-# 从而误判"已安装"。改用一个真实第三方依赖(torch/vllm)来判断是否需要安装。
-if ! python -c "import torch, vllm, minestudio" >/dev/null 2>&1; then
+# 从而误判"已安装"。改用几个真实第三方依赖(torch/vllm/minestudio/ray)来判断是否需要安装。
+# pip 从 PyPI 拉包(尤其是 `pip install -e .` 触发的 build-deps 解析，涉及大量包)
+# 偶发 502(files.pythonhosted.org 抖动)，之前这里没有重试也没有校验安装结果，
+# 网络一抖就导致 vllm/ray 等关键依赖没装上，之后要么vllm serve阶段
+# `vllm: command not found`直接FATAL退出，要么每个rollout都
+# `ModuleNotFoundError: No module named 'ray'`被rollout_wrapper 静默吞掉——
+# 二者都实测出现过(koala job axiomjin-eval-ckpt400-mini-*/qwen35-mini-*-20260818)。
+# 加重试+最终仍失败要真正 exit 1。
+if ! python -c "import torch, vllm, minestudio, ray" >/dev/null 2>&1; then
     echo "[setup] installing openagents + deps into openha env"
-    pip install -q torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
-    conda install --channel=conda-forge openjdk=8 -y -q
-    pip install -q -e .
+    for attempt in 1 2 3 4 5; do
+        pip install -q torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124 \
+            && pip install -q -e . \
+            && break
+        echo "[retry] openagents/torch/vllm/ray pip install failed (attempt ${attempt}/5), retrying in 20s..." >&2
+        sleep 20
+    done
+    if ! python -c "import torch, vllm, minestudio, ray" >/dev/null 2>&1; then
+        echo "[setup][FATAL] torch/vllm/minestudio/ray install/import still failing after retries, aborting (would otherwise silently produce 0 rollout results or crash at vllm-serve-launch)" >&2
+        exit 1
+    fi
 fi
 # openagents/agents/base.py 顶层无条件 `from sam2.build_sam import build_sam2_camera_predictor`
 # （即便 text_action 评测根本不用 grounding/SAM2）。仓库通过 git submodule 引用了一个
@@ -170,7 +197,15 @@ if [ "${VLLM_CONDA_ENV}" != "openha" ]; then
     fi
     conda activate "${VLLM_CONDA_ENV}"
     if ! python -c "import vllm" >/dev/null 2>&1; then
-        pip install -q --no-cache-dir "vllm==0.17.0"
+        for attempt in 1 2 3 4 5; do
+            pip install -q --no-cache-dir "vllm==0.17.0" && break
+            echo "[retry] vllm==0.17.0 pip install failed (attempt ${attempt}/5), retrying in 20s..." >&2
+            sleep 20
+        done
+    fi
+    if ! python -c "import vllm" >/dev/null 2>&1; then
+        echo "[setup][FATAL] vllm==0.17.0 install/import still failing after retries in ${VLLM_CONDA_ENV} env, aborting" >&2
+        exit 1
     fi
     echo "[setup] ${VLLM_CONDA_ENV} env ready: $(python -c 'import vllm;print(vllm.__version__)')"
     conda activate openha
