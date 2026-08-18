@@ -198,6 +198,26 @@ out = {
 json.dump(out, open('${PREPROCESSOR_CFG}', 'w'), indent=2)
 "
 fi
+# The merged `processor_config.json` itself is still a problem even after the
+# derivation above (which only *adds* preprocessor_config.json, it doesn't remove
+# the original file): its `video_processor` sub-dict is a plain JSON object with a
+# `video_processor_type` key, a schema this eval env's older transformers doesn't
+# know how to instantiate into a `BaseVideoProcessor`. `ProcessorMixin.from_pretrained`
+# prefers `processor_config.json` over `preprocessor_config.json` when both exist, so
+# it still loads the merged file, tries to build `Qwen2VLProcessor(image_processor,
+# tokenizer, video_processor, ...)` with the raw dict as `video_processor`, and crashes
+# with `TypeError: Received a dict for argument video_processor, but a
+# BaseVideoProcessor was expected.` at vllm server startup (confirmed in koala jobs
+# axiomjin-eval-ckpt{400,600,820}* on 2026-08-18, all failed ~3-7min in). The
+# officially released minecraft-textvla-qwen2vl-7b-2509 checkpoint never had a
+# processor_config.json (only the legacy flat preprocessor_config.json) and loads
+# fine, so move the merged file out of the way once we no longer need it as a
+# derivation source -- everything the old code path needs is already in
+# preprocessor_config.json/tokenizer_config.json.
+if [ -f "${PROCESSOR_CFG}" ]; then
+    echo "[compat] moving aside processor_config.json (incompatible video_processor schema for this eval env)"
+    mv "${PROCESSOR_CFG}" "${PROCESSOR_CFG}.bak"
+fi
 
 # ---------------------------------------------------------------------------
 # 4. 启动 vLLM OpenAI-compatible server（后台）
