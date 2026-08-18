@@ -135,6 +135,37 @@ else
     echo "[download] model already present at ${LOCAL_MODEL_DIR}, skip"
 fi
 
+# Checkpoints saved by trl_sft/train_sft.py's transformers>=5 write a
+# `extra_special_tokens` (dict-typed attribute-name -> token map) into
+# tokenizer_config.json. The much older transformers pinned in this eval
+# conda env doesn't understand that schema and unconditionally does
+# `special_tokens.keys()` on it in `_set_model_specific_special_tokens()`,
+# crashing with `AttributeError: 'list' object has no attribute 'keys'`
+# the moment vllm serve tries to load the tokenizer -- even though the
+# field is redundant metadata (the tokens it lists are already fully
+# defined via tokenizer.json/added_tokens_decoder, so dropping it doesn't
+# change tokenization behavior at all; the officially released
+# minecraft-textvla-qwen2vl-7b-2509 checkpoint never had this field and
+# loads fine). Strip it so any checkpoint trained with a newer
+# transformers can still be served here without a manual fix each time.
+TOKENIZER_CFG="${LOCAL_MODEL_DIR}/tokenizer_config.json"
+if [ -f "${TOKENIZER_CFG}" ] && python3 -c "
+import json, sys
+with open('${TOKENIZER_CFG}') as f:
+    sys.exit(0 if 'extra_special_tokens' in json.load(f) else 1)
+"; then
+    echo "[compat] removing incompatible 'extra_special_tokens' from tokenizer_config.json"
+    python3 -c "
+import json
+p = '${TOKENIZER_CFG}'
+with open(p) as f:
+    cfg = json.load(f)
+cfg.pop('extra_special_tokens', None)
+with open(p, 'w') as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+"
+fi
+
 # ---------------------------------------------------------------------------
 # 4. 启动 vLLM OpenAI-compatible server（后台）
 # ---------------------------------------------------------------------------
