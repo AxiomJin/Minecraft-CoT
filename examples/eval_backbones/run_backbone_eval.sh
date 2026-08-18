@@ -121,9 +121,23 @@ fi
 # （即便 text_action 评测根本不用 grounding/SAM2）。仓库通过 git submodule 引用了一个
 # 带camera_predictor 的 SAM2 fork(external/SAM2 -> zhwang4ai/SAM2)，但本环境未初始化
 # submodule，因此直接从该 fork 的 GitHub 地址 pip 安装，保证 import 不报错。
+# 注意：pip从 PyPI 装 sam2 的依赖(如iopath)时偶发 502(files.pythonhosted.org 抖动)，
+# 之前这里没有重试也没有校验安装结果，网络一抖就导致每个 rollout 一启动就
+# `ModuleNotFoundError: No module named 'sam2'`，被 rollout_wrapper 的 try/except
+# 静默吞掉——外层 job 显示 Succeeded，但 summary.json 里 per_task 是空的、什么都
+# 没跑出来（实测于 koala job axiomjin-eval-ckpt{400,600,820}-fix2-*-20260818）。
+# 加重试，且最终仍失败要真正 exit 1，不能悄悄跑出一个"成功但是空"的job。
 if ! python -c "from sam2.build_sam import build_sam2_camera_predictor" >/dev/null 2>&1; then
     echo "[setup] installing sam2 (zhwang4ai/SAM2 fork, for base.py import compatibility)"
-    pip install -q "git+https://github.com/zhwang4ai/SAM2.git"
+    for attempt in 1 2 3 4 5; do
+        pip install -q "git+https://github.com/zhwang4ai/SAM2.git" && break
+        echo "[retry] sam2 pip install failed (attempt ${attempt}/5), retrying in 15s..." >&2
+        sleep 15
+    done
+    if ! python -c "from sam2.build_sam import build_sam2_camera_predictor" >/dev/null 2>&1; then
+        echo "[setup][FATAL] sam2 install/import still failing after retries, aborting (would otherwise silently produce 0 rollout results)" >&2
+        exit 1
+    fi
 fi
 # minestudio 依赖 cuda-python 但未pin版本；pip默认装到cuda-python>=13(namespace 包，
 # 移除了 `from cuda import cuda, cudart` 这种旧式扁平API)，导致 minerl 的 gpu_utils.py
@@ -425,6 +439,18 @@ python "${REPO_ROOT}/examples/eval_backbones/aggregate_results.py" \
     --model_name "${MODEL_LOCAL_NAME}" \
     --output_json "${RECORD_ROOT}/summary.json"
 cat "${RECORD_ROOT}/summary.json"
+
+# 防止"静默失败"：rollout_wrapper 内部会 catch 所有异常只打印不上抛（例如某个
+# 依赖 import 失败/环境初始化失败），导致这个 job 在 shell 层面看起来正常跑完、
+# 状态显示 Succeeded，但实际一条有效 rollout 结果都没有产生。汇总后如果总数为0，
+# 在这里才真正让 job 失败退出，避免误判"评测已完成"。
+OVERALL_TOTAL=$(python3 -c "import json; print(json.load(open('${RECORD_ROOT}/summary.json'))['overall']['total'])")
+if [ "${OVERALL_TOTAL}" = "0" ]; then
+    echo "[summary][FATAL] 0 rollout results produced (overall.total=0) -- likely a silent setup/import failure upstream, check ${LOG_DIR}/ for tracebacks" >&2
+    kill "${VLLM_PID}" 2>/dev/null || true
+    aws s3 sync "${RECORD_ROOT}/" "${RESULT_S3_URI}/" --no-progress || true
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # 7. 停止 vLLM，回传结果到 S3
