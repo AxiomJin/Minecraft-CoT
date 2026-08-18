@@ -219,6 +219,52 @@ if [ -f "${PROCESSOR_CFG}" ]; then
     mv "${PROCESSOR_CFG}" "${PROCESSOR_CFG}.bak"
 fi
 
+# The model's own config.json has the exact same "newer transformers nests
+# everything" problem: transformers>=4.54's Qwen2VLConfig now stores all
+# text-backbone fields (vocab_size/hidden_size/num_hidden_layers/rope_theta/...)
+# inside a nested `text_config` sub-dict instead of flat on the top-level object.
+# `Qwen2VLConfig.__init__` only setattr's flat kwargs onto `self` via
+# `super().__init__(**kwargs)` -- fields consumed into `self.text_config` don't
+# also become top-level attributes. But vllm==0.8.5's `Qwen2Model.__init__`
+# (reused as the language-model backbone inside Qwen2VLForConditionalGeneration)
+# does plain flat attribute access like `config.vocab_size` / `config.hidden_size`
+# / `config.rope_scaling`, so with a nested-only config it crashes with
+# `AttributeError: 'Qwen2VLConfig' object has no attribute 'vocab_size'` right as
+# the model weights start loading (confirmed in koala job
+# axiomjin-eval-ckpt820-fix-normal-20260818-153150, after the processor_config.json
+# fix above got it past the earlier vllm-serve-startup crash). The officially
+# released minecraft-textvla-qwen2vl-7b-2509 checkpoint ships the old flat
+# schema (text fields directly at top level, only `vision_config` nested) and
+# loads fine. Promote every field out of `text_config` back onto the top level
+# (without clobbering any same-named top-level key that's already correct, e.g.
+# top-level `model_type`/`pad_token_id` must stay "qwen2_vl"/151643, not the
+# text-only "qwen2_vl_text"/null shadowed inside `text_config`), and translate
+# `rope_parameters` (new key) back into the old `rope_theta` + `rope_scaling`
+# pair vllm's decoder layers expect. `text_config`/`vision_config` are left in
+# place too -- transformers itself still parses them fine, this only *adds* the
+# flat duplicates vllm needs.
+MODEL_CFG="${LOCAL_MODEL_DIR}/config.json"
+if [ -f "${MODEL_CFG}" ] && python3 -c "
+import json, sys
+sys.exit(0 if 'text_config' in json.load(open('${MODEL_CFG}')) else 1)
+"; then
+    echo "[compat] flattening config.json's nested text_config onto top level (vllm 0.8.5 needs flat vocab_size/hidden_size/rope_scaling/...)"
+    python3 -c "
+import json
+p = '${MODEL_CFG}'
+cfg = json.load(open(p))
+tc = dict(cfg.get('text_config') or {})
+rope = tc.pop('rope_parameters', None)
+if rope:
+    tc.setdefault('rope_theta', rope.get('rope_theta', 1000000.0))
+    rope_type = rope.get('type') or rope.get('rope_type') or 'mrope'
+    tc.setdefault('rope_scaling', {'type': rope_type, 'mrope_section': rope.get('mrope_section')})
+for k, v in tc.items():
+    cfg.setdefault(k, v)
+json.dump(cfg, open(p, 'w'), indent=2)
+"
+fi
+
 # ---------------------------------------------------------------------------
 # 4. 启动 vLLM OpenAI-compatible server（后台）
 # ---------------------------------------------------------------------------
