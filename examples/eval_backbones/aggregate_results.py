@@ -10,6 +10,21 @@ import os
 from collections import defaultdict
 
 
+# 与论文 Embodied / GUI / Combat 三大类的对应关系（详见
+# openagents/envs/tasks/task_manager.py 里 5 个任务生成器的命名前缀）：
+#   Embodied = mine_block:*                              (导航+挖掘/砍伐，如"砍一棵树")
+#   GUI      = craft_item:* / smelt_item:* / custom:interact_with_*  (crafting table/furnace 等GUI交互)
+#   Combat   = kill_entity:*                             (击杀生物)
+def classify_task_category(task_name: str) -> str:
+    if task_name.startswith("mine_block:"):
+        return "Embodied"
+    if task_name.startswith("kill_entity:"):
+        return "Combat"
+    if task_name.startswith("craft_item:") or task_name.startswith("smelt_item:") or "interact_with" in task_name:
+        return "GUI"
+    return "Other"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--record_path", type=str, required=True)
@@ -48,10 +63,21 @@ def main():
     overall_success = sum(v["success"] for v in per_task.values())
     overall_total = sum(v["total"] for v in per_task.values())
 
+    # 按 Embodied / GUI / Combat 三大类聚合，对应论文 Table 3 的分组统计
+    # (avg_frames_on_success 对应论文的 "Steps" 列，success_rate 对应 "ASR" 列)。
+    per_category = defaultdict(lambda: {"success": 0, "total": 0, "frames_on_success": [], "tasks": set()})
+    for task, v in per_task.items():
+        cat = classify_task_category(task)
+        per_category[cat]["success"] += v["success"]
+        per_category[cat]["total"] += v["total"]
+        per_category[cat]["frames_on_success"].extend(v["frames_on_success"])
+        per_category[cat]["tasks"].add(task)
+
     summary = {
         "model_name": args.model_name,
         "per_task": {
             task: {
+                "category": classify_task_category(task),
                 "success": v["success"],
                 "total": v["total"],
                 "success_rate": (v["success"] / v["total"]) if v["total"] else None,
@@ -61,6 +87,19 @@ def main():
                 ),
             }
             for task, v in per_task.items()
+        },
+        "by_category": {
+            cat: {
+                "num_distinct_tasks": len(v["tasks"]),
+                "success": v["success"],
+                "total": v["total"],
+                "success_rate": (v["success"] / v["total"]) if v["total"] else None,
+                "avg_frames_on_success": (
+                    sum(f for f in v["frames_on_success"] if f is not None) / len(v["frames_on_success"])
+                    if v["frames_on_success"] else None
+                ),
+            }
+            for cat, v in per_category.items()
         },
         "overall": {
             "success": overall_success,

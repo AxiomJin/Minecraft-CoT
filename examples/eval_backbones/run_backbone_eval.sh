@@ -22,8 +22,29 @@ set -o pipefail
 : "${VLLM_CONDA_ENV:=openha}"
 
 # ---- 固定的、三模型共用的评测设置（保证公平对比） -------------------------
+# EVAL_BENCHMARK 决定评测规模，用于和原论文(OpenHA, arXiv:2509.13347)的
+# benchmark 对齐：
+#   smoke (默认) - 3个任务、difficulty=zero 的快速烟雾测试，不对应论文任何数值
+#   mini         - 30个代表性任务(Embodied/GUI/Combat各10个，easy/middle/hard均分)，
+#                  对应论文 Table 3 的 "mini benchmark"/代表性子集评测规模
+#   full         - 全部 800+ 个任务(单一difficulty=normal)，对应论文完整benchmark
+# mini/full 模式下会用 build_task_list.py 自动生成 TASK_DIFFICULTY_LIST(逐任务
+# 独立难度)，取代下面的 TASK_LIST + 全局 DIFFICULTY 组合。手动设置了
+# TASK_LIST或TASK_DIFFICULTY_LIST 的话，其优先级更高（用于调试单个任务）。
+export EVAL_BENCHMARK=${EVAL_BENCHMARK:-smoke}
 export TASK_LIST=${TASK_LIST:-"mine_block:oak_log kill_entity:sheep craft_item:crafting_table"}
-export ROLLOUTS_PER_TASK=${ROLLOUTS_PER_TASK:-5}
+export TASK_DIFFICULTY_LIST=${TASK_DIFFICULTY_LIST:-}
+case "${EVAL_BENCHMARK}" in
+    mini)
+        export ROLLOUTS_PER_TASK=${ROLLOUTS_PER_TASK:-10}
+        ;;
+    full)
+        export ROLLOUTS_PER_TASK=${ROLLOUTS_PER_TASK:-3}
+        ;;
+    *)
+        export ROLLOUTS_PER_TASK=${ROLLOUTS_PER_TASK:-5}
+        ;;
+esac
 export MAX_STEPS_NUM=${MAX_STEPS_NUM:-200}
 export MAXIMUM_HISTORY_LENGTH=${MAXIMUM_HISTORY_LENGTH:-3}
 export DIFFICULTY=${DIFFICULTY:-zero}
@@ -48,9 +69,25 @@ LOG_DIR="/local-ssd/logs/${MODEL_LOCAL_NAME}"
 export MINESTUDIO_DIR="${MINESTUDIO_DIR:-/local-ssd/minestudio}"
 mkdir -p "${LOCAL_MODEL_DIR}" "${RECORD_ROOT}" "${LOG_DIR}" "${MINESTUDIO_DIR}"
 
+# mini/full 模式下自动生成逐任务差异化难度的 TASK_DIFFICULTY_LIST（除非已手动
+# 指定 TASK_DIFFICULTY_LIST，那样直接尊重用户手动给的列表）。仅依赖标准库，
+# 不需要等 conda env 装好。
+if [ "${EVAL_BENCHMARK}" != "smoke" ] && [ -z "${TASK_DIFFICULTY_LIST}" ]; then
+    echo "[task-list] generating EVAL_BENCHMARK=${EVAL_BENCHMARK} task list via build_task_list.py"
+    export TASK_LIST_MANIFEST="${RECORD_ROOT}/task_list_manifest.json"
+    TASK_DIFFICULTY_LIST="$(python3 "$(dirname "$0")/build_task_list.py" --scope "${EVAL_BENCHMARK}")"
+    export TASK_DIFFICULTY_LIST
+    echo "[task-list] $(echo "${TASK_DIFFICULTY_LIST}" | wc -w) tasks, manifest -> ${TASK_LIST_MANIFEST}"
+fi
+
 echo "=============================================================="
 echo "[eval] model=${MODEL_LOCAL_NAME} served_name=${SERVED_MODEL_NAME} vllm_env=${VLLM_CONDA_ENV}"
-echo "[eval] tasks=${TASK_LIST} rollouts_per_task=${ROLLOUTS_PER_TASK} max_steps=${MAX_STEPS_NUM}"
+echo "[eval] benchmark=${EVAL_BENCHMARK} rollouts_per_task=${ROLLOUTS_PER_TASK} max_steps=${MAX_STEPS_NUM}"
+if [ -n "${TASK_DIFFICULTY_LIST}" ]; then
+    echo "[eval] tasks(task@difficulty, $(echo "${TASK_DIFFICULTY_LIST}" | wc -w) total)=${TASK_DIFFICULTY_LIST}"
+else
+    echo "[eval] tasks=${TASK_LIST} difficulty=${DIFFICULTY}"
+fi
 echo "=============================================================="
 
 source /opt/conda/etc/profile.d/conda.sh 2>/dev/null || source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -316,34 +353,67 @@ fi
 
 # ---------------------------------------------------------------------------
 # 5. 逐任务跑 rollout（openha env，online模式，纯HTTP调用，与vllm版本无关）
+#    优先用 TASK_DIFFICULTY_LIST（"task@difficulty" token序列，逐任务独立难度，
+#    由 mini/full benchmark 模式自动生成）；未设置时回退到旧的
+#    TASK_LIST + 全局 DIFFICULTY 组合（用于 smoke 模式 / 手动调试单任务）。
 # ---------------------------------------------------------------------------
 conda activate openha
 cd "${REPO_ROOT}"
-for TASK in ${TASK_LIST}; do
-    echo "------------------------------------------------------------"
-    echo "[rollout] task=${TASK} num_rollouts=${ROLLOUTS_PER_TASK}"
-    echo "------------------------------------------------------------"
-    python examples/rollout_openha.py \
-        --output_mode "${OUTPUT_MODE}" \
-        --vlm_client_mode online \
-        --system_message_tag "${SYSTEM_MESSAGE_TAG}" \
-        --model_ips localhost \
-        --model_ports "${VLLM_PORT}" \
-        --model_id "${SERVED_MODEL_NAME}" \
-        --model_path "${LOCAL_MODEL_DIR}" \
-        --record_path "${RECORD_ROOT}" \
-        --max_steps_num "${MAX_STEPS_NUM}" \
-        --maximum_history_length "${MAXIMUM_HISTORY_LENGTH}" \
-        --task "${TASK}" \
-        --difficulty "${DIFFICULTY}" \
-        --temperature "${TEMPERATURE}" \
-        --top_p "${TOP_P}" \
-        --top_k "${TOP_K}" \
-        --fps "${FPS}" \
-        --gpu_per_rollout "${GPU_PER_ROLLOUT}" \
-        --num_rollouts "${ROLLOUTS_PER_TASK}" \
-        2>&1 | tee -a "${LOG_DIR}/rollout_${TASK//[:,]/_}.log"
-done
+if [ -n "${TASK_DIFFICULTY_LIST}" ]; then
+    for TASK_DIFF in ${TASK_DIFFICULTY_LIST}; do
+        TASK="${TASK_DIFF%@*}"
+        TASK_DIFFICULTY="${TASK_DIFF##*@}"
+        echo "------------------------------------------------------------"
+        echo "[rollout] task=${TASK} difficulty=${TASK_DIFFICULTY} num_rollouts=${ROLLOUTS_PER_TASK}"
+        echo "------------------------------------------------------------"
+        python examples/rollout_openha.py \
+            --output_mode "${OUTPUT_MODE}" \
+            --vlm_client_mode online \
+            --system_message_tag "${SYSTEM_MESSAGE_TAG}" \
+            --model_ips localhost \
+            --model_ports "${VLLM_PORT}" \
+            --model_id "${SERVED_MODEL_NAME}" \
+            --model_path "${LOCAL_MODEL_DIR}" \
+            --record_path "${RECORD_ROOT}" \
+            --max_steps_num "${MAX_STEPS_NUM}" \
+            --maximum_history_length "${MAXIMUM_HISTORY_LENGTH}" \
+            --task "${TASK}" \
+            --difficulty "${TASK_DIFFICULTY}" \
+            --temperature "${TEMPERATURE}" \
+            --top_p "${TOP_P}" \
+            --top_k "${TOP_K}" \
+            --fps "${FPS}" \
+            --gpu_per_rollout "${GPU_PER_ROLLOUT}" \
+            --num_rollouts "${ROLLOUTS_PER_TASK}" \
+            2>&1 | tee -a "${LOG_DIR}/rollout_${TASK//[:,]/_}.log"
+    done
+else
+    for TASK in ${TASK_LIST}; do
+        echo "------------------------------------------------------------"
+        echo "[rollout] task=${TASK} num_rollouts=${ROLLOUTS_PER_TASK}"
+        echo "------------------------------------------------------------"
+        python examples/rollout_openha.py \
+            --output_mode "${OUTPUT_MODE}" \
+            --vlm_client_mode online \
+            --system_message_tag "${SYSTEM_MESSAGE_TAG}" \
+            --model_ips localhost \
+            --model_ports "${VLLM_PORT}" \
+            --model_id "${SERVED_MODEL_NAME}" \
+            --model_path "${LOCAL_MODEL_DIR}" \
+            --record_path "${RECORD_ROOT}" \
+            --max_steps_num "${MAX_STEPS_NUM}" \
+            --maximum_history_length "${MAXIMUM_HISTORY_LENGTH}" \
+            --task "${TASK}" \
+            --difficulty "${DIFFICULTY}" \
+            --temperature "${TEMPERATURE}" \
+            --top_p "${TOP_P}" \
+            --top_k "${TOP_K}" \
+            --fps "${FPS}" \
+            --gpu_per_rollout "${GPU_PER_ROLLOUT}" \
+            --num_rollouts "${ROLLOUTS_PER_TASK}" \
+            2>&1 | tee -a "${LOG_DIR}/rollout_${TASK//[:,]/_}.log"
+    done
+fi
 
 # ---------------------------------------------------------------------------
 # 6. 汇总成功率
