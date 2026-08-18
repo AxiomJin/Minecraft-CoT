@@ -166,6 +166,39 @@ with open(p, 'w') as f:
 "
 fi
 
+# Same story for the image processor config: newer transformers' Qwen2VLProcessor
+# saves a single merged `processor_config.json` (nesting image_processor/
+# video_processor sub-dicts), but this eval env's older transformers/vllm only
+# know how to load the legacy flat `preprocessor_config.json` (min_pixels,
+# max_pixels, patch_size, ... at the top level) -- without it vllm's image
+# processor loading fails with `OSError: ... does not appear to have a file
+# named preprocessor_config.json`. Derive one from processor_config.json's
+# image_processor block when it's missing (the officially released
+# minecraft-textvla-qwen2vl-7b-2509 checkpoint ships preprocessor_config.json
+# directly and needs no fix).
+PREPROCESSOR_CFG="${LOCAL_MODEL_DIR}/preprocessor_config.json"
+PROCESSOR_CFG="${LOCAL_MODEL_DIR}/processor_config.json"
+if [ ! -f "${PREPROCESSOR_CFG}" ] && [ -f "${PROCESSOR_CFG}" ]; then
+    echo "[compat] deriving preprocessor_config.json from processor_config.json"
+    python3 -c "
+import json
+src = json.load(open('${PROCESSOR_CFG}'))
+ip = src['image_processor']
+out = {
+    'min_pixels': ip['size']['shortest_edge'],
+    'max_pixels': ip['size']['longest_edge'],
+    'patch_size': ip['patch_size'],
+    'temporal_patch_size': ip['temporal_patch_size'],
+    'merge_size': ip['merge_size'],
+    'image_mean': ip['image_mean'],
+    'image_std': ip['image_std'],
+    'image_processor_type': ip['image_processor_type'],
+    'processor_class': src['processor_class'],
+}
+json.dump(out, open('${PREPROCESSOR_CFG}', 'w'), indent=2)
+"
+fi
+
 # ---------------------------------------------------------------------------
 # 4. 启动 vLLM OpenAI-compatible server（后台）
 # ---------------------------------------------------------------------------
