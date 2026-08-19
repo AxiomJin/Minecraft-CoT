@@ -21,33 +21,46 @@
 #   CKPT             仅对 launch_textvla_*_checkpoint.sh 有意义，指定要评测的
 #                    训练 step（如 400/600/820）。
 #   CODE_S3_URI      代码同步的S3路径，默认 s3://arcwm-code-us-west-2/axiom/code
-#   JOB_TAG          job名后缀，默认用当前时间戳，用于区分同一模型的多次提交
 # ============================================================================
 set -euo pipefail
 
 LAUNCH_SCRIPT="${1:?用法: bash submit_eval_job.sh <launch_script.sh>，例如 launch_qwen35.sh}"
 CODE_S3_URI="${CODE_S3_URI:-s3://arcwm-code-us-west-2/axiom/code}"
-JOB_TAG="${JOB_TAG:-$(date +%Y%m%d%H%M%S)}"
 
-MODEL_TAG="${LAUNCH_SCRIPT#launch_}"
-MODEL_TAG="${MODEL_TAG%.sh}"
-MODEL_TAG="${MODEL_TAG//_/-}"   # koala job名仅支持小写字母/数字/连字符，不能有下划线
+# koala对 -j 传入的前缀名限制为29字符(其后会自动追加 "-<mode>-<timestamp>"
+# 拼成完整job名，总长≤52)，不能直接用完整launch脚本名，需要一份简称映射表。
+# 未来新增 launch_<model>.sh 时，请在这里补一条对应的短别名。
+case "${LAUNCH_SCRIPT}" in
+    launch_qwen2vl.sh)                         SHORT_TAG="q2vl" ;;
+    launch_qwen25vl.sh)                        SHORT_TAG="q25vl" ;;
+    launch_qwen35.sh)                          SHORT_TAG="q35" ;;
+    launch_textvla_qwen2vl_7b.sh)              SHORT_TAG="tv-q2vl" ;;
+    launch_textvla_qwen2vl_7b_checkpoint.sh)   SHORT_TAG="tv-q2vl" ;;
+    launch_textvla_qwen35_9b_checkpoint.sh)    SHORT_TAG="tv-q35" ;;
+    *)
+        # 未知脚本：用脚本名(去掉launch_/.sh、下划线转连字符)截断到8字符 + 4位hash保证唯一
+        SHORT_TAG="${LAUNCH_SCRIPT#launch_}"
+        SHORT_TAG="${SHORT_TAG%.sh}"
+        SHORT_TAG="${SHORT_TAG//_/-}"
+        SHORT_TAG="${SHORT_TAG:0:8}-$(echo -n "${LAUNCH_SCRIPT}" | md5 2>/dev/null || echo -n "${LAUNCH_SCRIPT}" | md5sum | cut -c1-4)"
+        SHORT_TAG="${SHORT_TAG:0:13}"
+        ;;
+esac
+
 CKPT_SUFFIX=""
 CKPT_EXPORT=""
 if [ -n "${CKPT:-}" ]; then
-    CKPT_SUFFIX="-ckpt${CKPT}"
+    CKPT_SUFFIX="-c${CKPT}"
     CKPT_EXPORT="export CKPT=${CKPT}; "
 fi
 BENCH_EXPORT=""
-BENCH_SUFFIX=""
 if [ -n "${EVAL_BENCHMARK:-}" ]; then
     BENCH_EXPORT="export EVAL_BENCHMARK=${EVAL_BENCHMARK}; "
-    BENCH_SUFFIX="-${EVAL_BENCHMARK}"
 fi
 
-# koala job名有长度限制(含koala自动追加的 -normal-<timestamp> 后缀)，稳妥截断。
-JOB_NAME="axiomjin-eval-${MODEL_TAG}${CKPT_SUFFIX}${BENCH_SUFFIX}-${JOB_TAG}"
-JOB_NAME="${JOB_NAME:0:55}"
+# "axiomjin-eval-"(14字符) + SHORT_TAG + CKPT_SUFFIX，务必控制在29字符以内。
+JOB_NAME="axiomjin-eval-${SHORT_TAG}${CKPT_SUFFIX}"
+JOB_NAME="${JOB_NAME:0:29}"
 
 REMOTE_CMD="set -euo pipefail; export REPO_ROOT=/data/work/run_codes/Minecraft-CoT; ${CKPT_EXPORT}${BENCH_EXPORT}cd /data/work/run_codes/Minecraft-CoT; apt-get update -qq 2>&1 | tail -3 || true; apt-get install -y -qq xvfb 2>&1 | tail -5 || true; bash examples/eval_backbones/${LAUNCH_SCRIPT}"
 
