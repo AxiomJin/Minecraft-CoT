@@ -31,6 +31,7 @@ JOB_TAG="${JOB_TAG:-$(date +%Y%m%d%H%M%S)}"
 
 MODEL_TAG="${LAUNCH_SCRIPT#launch_}"
 MODEL_TAG="${MODEL_TAG%.sh}"
+MODEL_TAG="${MODEL_TAG//_/-}"   # koala job名仅支持小写字母/数字/连字符，不能有下划线
 CKPT_SUFFIX=""
 CKPT_EXPORT=""
 if [ -n "${CKPT:-}" ]; then
