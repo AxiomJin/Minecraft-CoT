@@ -23,15 +23,18 @@ set -o pipefail
 
 # ---- 固定的、三模型共用的评测设置（保证公平对比） -------------------------
 # EVAL_BENCHMARK 决定评测规模，用于和原论文(OpenHA, arXiv:2509.13347)的
-# benchmark 对齐：
-#   smoke (默认) - 3个任务、difficulty=zero 的快速烟雾测试，不对应论文任何数值
-#   mini         - 30个代表性任务(Embodied/GUI/Combat各10个，easy/middle/hard均分)，
-#                  对应论文 Table 3 的 "mini benchmark"/代表性子集评测规模
+# benchmark 对齐。【自2026-08-19起，mini 已固化为本项目的标准/默认评测协议】：
+#   mini (默认)  - 30个代表性任务(Embodied/GUI/Combat各10个，easy/middle/hard均分)，
+#                  seed=42固定采样，对应论文 Table 3 的代表性子集评测规模。
+#                  以后所有backbone/checkpoint对比实验都应使用这套固定任务+设置，
+#                  以保证跨模型、跨时间点的可比性。
+#   smoke        - 3个任务、difficulty=zero 的快速烟雾测试(仅用于验证环境/代码
+#                  改动是否能跑通，不用于产出可比较的评测数值)
 #   full         - 全部 800+ 个任务(单一difficulty=normal)，对应论文完整benchmark
 # mini/full 模式下会用 build_task_list.py 自动生成 TASK_DIFFICULTY_LIST(逐任务
 # 独立难度)，取代下面的 TASK_LIST + 全局 DIFFICULTY 组合。手动设置了
 # TASK_LIST或TASK_DIFFICULTY_LIST 的话，其优先级更高（用于调试单个任务）。
-export EVAL_BENCHMARK=${EVAL_BENCHMARK:-smoke}
+export EVAL_BENCHMARK=${EVAL_BENCHMARK:-mini}
 export TASK_LIST=${TASK_LIST:-"mine_block:oak_log kill_entity:sheep craft_item:crafting_table"}
 export TASK_DIFFICULTY_LIST=${TASK_DIFFICULTY_LIST:-}
 case "${EVAL_BENCHMARK}" in
