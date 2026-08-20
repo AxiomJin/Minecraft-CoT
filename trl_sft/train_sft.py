@@ -271,11 +271,35 @@ def download_from_s3(s3_path: str, local_dir: str, exclude_checkpoints: bool = F
 # ─── dataset helpers ──────────────────────────────────────────────────────────
 
 
+def _assistant_action_text(conversations: list, turn: int) -> str:
+    """Return the concatenated text of the assistant message of the given zero-based
+    trajectory turn, used to detect consecutive IDENTICAL actions for focal suppression.
+
+    ``conversations`` follows the strict ``[user_0, assistant_0, user_1, assistant_1,
+    ...]`` layout (the pairing `build_messages` establishes after dropping any stray
+    leading turn), so the assistant of turn ``t`` lives at index ``2*t + 1``. Non-text
+    content items are skipped (action turns in `minecraft-text-action-dataset` are pure
+    text: ``Action: move(...) and press(...)``), so the result is effectively the full
+    action string used for equality comparison.
+    """
+    if not conversations or 2 * turn + 1 >= len(conversations):
+        return ""
+    content = conversations[2 * turn + 1].get("content", [])
+    if isinstance(content, str):
+        return content
+    parts = []
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "text":
+            parts.append(item.get("text", ""))
+    return "".join(parts)
+
+
 def build_messages(
     conversations: list,
     image_bytes_list: list,
     max_turns: int,
     rng: Optional[random.Random] = None,
+    focal_gamma: Optional[float] = None,
 ) -> Tuple[Optional[List[Dict]], Optional[List[Dict]], Optional[List[Image.Image]]]:
     """
     Convert a single parquet row into TRL's conversational *prompt-completion* format:
@@ -296,6 +320,11 @@ def build_messages(
             the global `random` module (fine for single-threaded/debug use, but callers
             with per-sample determinism needs -- e.g. `_row_to_trl_sample` -- should
             pass their own local instance instead of relying on/mutating global state).
+        focal_gamma: focal repeated-action suppression rate (OpenHA Stage-III recipe).
+            Consecutive identical assistant actions are skipped with keep-probability
+            ``focal_gamma**k`` so long runs of a "safe" repeated action (e.g.
+            ``move(0, 0)`` while walking) can't dominate the loss. ``None`` or any value
+            outside ``(0, 1)`` disables it (completion is always the last turn).
 
     Returns:
         (prompt, completion, images):
@@ -319,26 +348,67 @@ def build_messages(
     # Count total turns
     total_turns = len(conversations) // 2
 
-    # Random history length: 0 to min(total_turns-1, max_turns)
-    max_possible = min(total_turns - 1, max_turns)
+    # --- focal: pick the completion turn, suppressing consecutive identical actions ---
+    # OpenHA's official Stage-III recipe (`Qwen2_5VLFocalChatTemplate`) downweights /
+    # probabilistically masks consecutive IDENTICAL assistant actions at a `0.75**k`
+    # geometric rate, so long runs of a "safe" repeated action -- most importantly
+    # `Action: move(0, 0) and press(...)` while walking straight -- cannot dominate the
+    # loss and collapse the model into always predicting that mode (the exact failure we
+    # observed: our earlier Stage-III checkpoints output `move(0,0)` ~99.5% of the time).
+    # Our single-completion architecture (only the LAST assistant turn is the training
+    # target) has no per-step loss-mask, so we reproduce the same suppression at sampling
+    # time instead: walk backwards from the trajectory tail and, for each action identical
+    # to its predecessor, probabilistically skip it (keep probability `focal_gamma**k`) so
+    # the completion lands on an action *change* point rather than another repeated frame.
+    completion_turn = total_turns - 1
+    if focal_gamma is not None and 0.0 < focal_gamma < 1.0:
+        # Exactly replicate OpenHA's `Qwen2_5VLFocalChatTemplate` focal_alpha
+        # accumulation: alpha *= focal_gamma when an action equals its predecessor
+        # (so the 1st repeat after a change point is 0.75, the 2nd 0.5625, ...), and
+        # reset to 1.0 when the action changes. A change point's alpha is always 1.0.
+        alphas = [1.0] * total_turns
+        alpha = 1.0
+        for t in range(1, total_turns):
+            if _assistant_action_text(conversations, t - 1) == _assistant_action_text(conversations, t):
+                alpha *= focal_gamma
+            else:
+                alpha = 1.0
+            alphas[t] = alpha
+        # Walk backwards from the trajectory tail: a change point (alpha=1.0) is always
+        # kept; a repeated action is kept with probability `alphas[t]` (= focal_gamma**k,
+        # k = its position inside the run), otherwise skipped. The completion therefore
+        # lands preferentially on an action *change* point, suppressing long runs of a
+        # repeated action (e.g. move(0,0) while walking straight) from dominating the loss.
+        turn = total_turns - 1
+        while turn > 0:
+            if alphas[turn] >= 1.0 or rng.random() < alphas[turn]:
+                break  # keep this turn
+            turn -= 1  # skip this repeated action, keep scanning backwards
+        completion_turn = turn
+
+    # Random history length: 0 to min(completion_turn, max_turns)
+    max_possible = min(completion_turn, max_turns)
     if max_possible < 0:
         return None, None, None
     history_len = rng.randint(0, max_possible)
 
-    # Take the last (history_len + 1) turns
-    start_turn = total_turns - (history_len + 1)
+    # Take the last (history_len + 1) turns ending at completion_turn
+    start_turn = completion_turn - history_len
     start_idx = start_turn * 2
 
-    selected_convs = conversations[start_idx:]
-    # NOTE: this slices `image_bytes_list` by *pair index* (`start_turn`), which matches
-    # `minecraft-text-action-dataset`'s parquet schema: exactly one `image_bytes` entry
-    # per (user, assistant) trajectory step, regardless of whether that step's user turn
-    # actually contains an image placeholder. This is different from the FLAT,
-    # encounter-order indexing that `_split_prompt_completion_with_images` below uses for
-    # the actual placeholder <-> bytes matching -- see `build_messages_qa` for a dataset
-    # format (`minecraft-vlp`) where that flat/no-slicing behavior is what's needed
-    # instead.
-    selected_image_bytes = image_bytes_list[start_turn:] if image_bytes_list else []
+    if completion_turn == total_turns - 1:
+        # completion is the trajectory's true last turn -> slice through the end of the
+        # list (identical to the pre-focal behavior, and robust to odd-length lists)
+        selected_convs = conversations[start_idx:]
+        # NOTE: this slices `image_bytes_list` by *pair index* (`start_turn`), which
+        # matches `minecraft-text-action-dataset`'s parquet schema: exactly one
+        # `image_bytes` entry per (user, assistant) trajectory step. See
+        # `build_messages_qa` for the FLAT/no-slicing indexing used by the jsonl format.
+        selected_image_bytes = image_bytes_list[start_turn:] if image_bytes_list else []
+    else:
+        # focal skipped some trailing repeated turns -> truncate at completion_turn
+        selected_convs = conversations[start_idx:(completion_turn * 2 + 2)]
+        selected_image_bytes = image_bytes_list[start_turn:(completion_turn + 1)] if image_bytes_list else []
 
     return _split_prompt_completion_with_images(selected_convs, selected_image_bytes)
 
@@ -601,6 +671,7 @@ def _row_to_trl_sample(
     text_only: bool = False,
     processor=None,
     max_seq_length: Optional[int] = None,
+    focal_gamma: Optional[float] = None,
 ) -> Dict:
     """
     Map ONE raw dataset row (parquet trajectory step OR jsonl QA session, per
@@ -683,14 +754,15 @@ def _row_to_trl_sample(
                 return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
     else:
         def _build(turns: int):
-            # Fresh rng per attempt so the drawn history length stays a pure function of
-            # (seed, sample_id, turns) -- i.e. identical on every rank, never dependent on
-            # how many attempts happened to run.
+            # Fresh rng per attempt so the drawn history length (and focal completion-turn
+            # skip) stays a pure function of (seed, sample_id, turns) -- i.e. identical on
+            # every rank, never dependent on how many attempts happened to run.
             return build_messages(
                 conversations=sample["conversations"],
                 image_bytes_list=sample.get("image_bytes", []),
                 max_turns=turns,
                 rng=random.Random(f"{seed}-{sample_id}"),
+                focal_gamma=focal_gamma,
             )
 
         prompt, completion, images = _build(max_turns)
@@ -917,6 +989,7 @@ def build_minecraft_dataset(
     text_only: bool = False,
     processor=None,
     max_seq_length: Optional[int] = None,
+    focal_gamma: Optional[float] = None,
 ):
     """
     Build the Minecraft SFT dataset as a genuine `datasets.Dataset` (`streaming=False`)
@@ -1028,6 +1101,7 @@ def build_minecraft_dataset(
             "text_only": text_only,
             "processor": processor,
             "max_seq_length": max_seq_length,
+            "focal_gamma": focal_gamma,
         },
         remove_columns=raw_columns,
     )
@@ -1210,6 +1284,7 @@ def debug_dry_run(args):
         text_only=args.text_only,
         processor=processor,
         max_seq_length=args.max_seq_length,
+        focal_gamma=args.focal_gamma,
     )
 
     sft_config_field_names = {f.name for f in dataclass_fields(SFTConfig)}
@@ -1365,6 +1440,18 @@ def main():
         "use 'none' to force a new run.",
     )
     parser.add_argument("--max_turns", type=int, default=4, help="Max (user,assistant) pairs per sample")
+    parser.add_argument(
+        "--focal_gamma",
+        type=float,
+        default=0.75,
+        help="Focal repeated-action suppression rate for Stage III (OpenHA "
+        "Qwen2_5VLFocalChatTemplate's focal_alpha). Consecutive identical assistant "
+        "actions are skipped with keep-probability focal_gamma^k so long runs of a "
+        "'safe' repeated action (e.g. move(0,0) while walking straight) cannot dominate "
+        "the loss and collapse the model into always predicting that mode. 0.75 "
+        "replicates the official recipe; pass 1.0 (or 0) to disable. Only affects the "
+        "parquet/trajectory path (build_messages), not text_only/jsonl.",
+    )
     parser.add_argument("--max_seq_length", type=int, default=16384)
     parser.add_argument("--per_device_batch_size", type=int, default=2)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
@@ -1531,6 +1618,7 @@ def main():
         # `text_only` samples have no images so this is a no-op for Stage I regardless.
         processor=processor,
         max_seq_length=args.max_seq_length,
+        focal_gamma=args.focal_gamma,
     )
 
     # ── training config ──
