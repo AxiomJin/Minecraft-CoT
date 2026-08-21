@@ -120,6 +120,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 logger = logging.getLogger(__name__)
 
+# HuggingFace / VeOmni convention for "do not compute loss on this token". Used by the
+# VeOmni-aligned collator below to mask every token that is not an assistant turn.
+IGNORE_INDEX = -100
+
 
 # ─── hang diagnostics ──────────────────────────────────────────────────────────
 #
@@ -500,6 +504,57 @@ def _split_prompt_completion_with_images(
     return prompt, completion, images
 
 
+def build_full_trajectory(
+    conversations: List[Dict],
+    image_bytes_list: List[bytes],
+) -> Tuple[Optional[List[Dict]], Optional[List[Image.Image]]]:
+    """
+    Convert ONE parquet trajectory row into the VeOmni-aligned *full-trajectory* format:
+    the COMPLETE `messages` list (system prompt + instruction + every (image, action)
+    step, nothing truncated) plus the flat decoded `images` list.
+
+    Unlike `build_messages` (which samples a random history window and splits off only
+    the final assistant turn as the training target for `completion_only_loss`), this
+    keeps EVERY turn. Combined with `_VeOmniAlignedVisionCollator` it reproduces
+    OpenHA's official Stage-III recipe: every assistant "Action: ..." turn contributes
+    to the loss (multi-step loss), `{"type": "image"}` placeholders stay in-place inside
+    `messages` while their decoded pixels go into the top-level `images` list in
+    encounter order, and consecutive identical actions are focal-suppressed inside the
+    collator (not at sampling time as `build_messages` does).
+    """
+    if not conversations or len(conversations) < 2:
+        return None, None
+    # Same stray-leading-turn guard as `build_messages`: drop a non-user first turn so
+    # the [user_0, assistant_0, user_1, assistant_1, ...] pairing stays aligned.
+    if conversations[0]["role"] != "user":
+        conversations = conversations[1:]
+    if not conversations or conversations[-1]["role"] != "assistant":
+        return None, None
+
+    messages = []
+    images: List[Image.Image] = []
+    image_idx = 0
+    for conv in conversations:
+        role = conv["role"]
+        content_list = []
+        for item in conv["content"]:
+            if item.get("type") == "text":
+                content_list.append({"type": "text", "text": item.get("text", "")})
+            elif item.get("type") == "image":
+                if image_idx < len(image_bytes_list):
+                    try:
+                        img = Image.open(io.BytesIO(image_bytes_list[image_idx])).convert("RGB")
+                        content_list.append({"type": "image"})
+                        images.append(img)
+                    except Exception as e:
+                        logger.warning(f"Failed to decode image at idx {image_idx}: {e}")
+                        content_list.append({"type": "text", "text": "[image]"})
+                image_idx += 1
+        messages.append({"role": role, "content": content_list})
+
+    return messages, images
+
+
 def _read_bytes(uri: str) -> bytes:
     """Read raw bytes from a local path or any `fsspec`-supported URI (e.g. `s3://...`,
     via the `s3fs` dependency)."""
@@ -672,6 +727,7 @@ def _row_to_trl_sample(
     processor=None,
     max_seq_length: Optional[int] = None,
     focal_gamma: Optional[float] = None,
+    full_trajectory: bool = False,
 ) -> Dict:
     """
     Map ONE raw dataset row (parquet trajectory step OR jsonl QA session, per
@@ -753,6 +809,24 @@ def _row_to_trl_sample(
             if _exceeds_max_length(processor, prompt, completion, images, max_seq_length, chat_template_kwargs):
                 return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
     else:
+        if full_trajectory:
+            # VeOmni-aligned Stage-III mode: keep the ENTIRE trajectory (system prompt +
+            # instruction + every (image, action) step), no random history window. The
+            # multi-step loss + focal suppression happen later in `_VeOmniAlignedVisionCollator`,
+            # not here. Oversized trajectories are dropped defensively (same rationale as
+            # the prompt/completion path below: truncation through a vision-token block
+            # crashes the forward pass).
+            messages, images = build_full_trajectory(
+                conversations=sample["conversations"],
+                image_bytes_list=sample.get("image_bytes", []),
+            )
+            if messages is None:
+                return {"messages": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
+            if images and processor is not None and max_seq_length is not None:
+                if _exceeds_max_length(processor, messages[:-1], [messages[-1]], images, max_seq_length, chat_template_kwargs):
+                    return {"messages": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
+            return {"messages": messages, "images": images, "chat_template_kwargs": chat_template_kwargs, "_keep": True}
+
         def _build(turns: int):
             # Fresh rng per attempt so the drawn history length (and focal completion-turn
             # skip) stays a pure function of (seed, sample_id, turns) -- i.e. identical on
@@ -990,6 +1064,7 @@ def build_minecraft_dataset(
     processor=None,
     max_seq_length: Optional[int] = None,
     focal_gamma: Optional[float] = None,
+    full_trajectory: bool = False,
 ):
     """
     Build the Minecraft SFT dataset as a genuine `datasets.Dataset` (`streaming=False`)
@@ -1102,6 +1177,7 @@ def build_minecraft_dataset(
             "processor": processor,
             "max_seq_length": max_seq_length,
             "focal_gamma": focal_gamma,
+            "full_trajectory": full_trajectory,
         },
         remove_columns=raw_columns,
     )
@@ -1200,6 +1276,149 @@ def _clone_conversation(messages):
     return cloned_messages
 
 
+class _VeOmniAlignedVisionCollator:
+    """Vision-language collator that reproduces OpenHA's official Stage-III recipe.
+
+    TRL's own VLM collator (`DataCollatorForVisionLanguageModeling`) cannot express
+    "compute loss on EVERY assistant turn of a multi-turn trajectory": its
+    language-modeling path only masks padding (`labels = input_ids.clone()`), and the
+    `assistant_only_loss` mechanism is hard-rejected for vision datasets at
+    `SFTTrainer.__init__` time. This collator closes that gap by reimplementing, on the
+    collator path, exactly what VeOmni's `Qwen2VLChatTemplate` /
+    `Qwen2_5VLFocalChatTemplate.encode_messages` do:
+
+      * every message is tokenized INDIVIDUALLY as
+        `<|im_start|>{role}\n{content}<|im_end|>\n` (so each message's token boundary is
+        exact -- no reliance on `apply_chat_template`'s `return_assistant_tokens_mask`,
+        which we verified returns all-zeros for vision inputs);
+      * `{"type": "image"}` placeholders are rendered as
+        `<|vision_start|><|image_pad|>*N<|vision_end|>` with N = t*h*w from the
+        image processor's `image_grid_thw` (exact vision-token count);
+      * labels keep the token ids for `assistant` turns and set `IGNORE_INDEX` for
+        every other turn (system/user/image/padding) -- i.e. multi-step loss on every
+        "Action: ..." turn of the trajectory;
+      * focal repeated-action suppression: consecutive IDENTICAL assistant actions have
+        their loss-mask kept with probability `focal_gamma**k` (k = position inside the
+        run), starting from `focal_alpha=1.0` and multiplying by `focal_gamma` on each
+        repeat -- the exact `0.75**k` geometric schedule VeOmni uses.
+
+    No `system` message is emitted (matching VeOmni, whose `_get_system_mesage()` call
+    is commented out): the dataset's system prompt already lives inside the first user
+    turn's text, so the token stream is byte-compatible with VeOmni's training-time
+    layout.
+
+    Input example shape (from `build_full_trajectory`):
+        {"messages": [{"role", "content": [{"type": "text"/"image"}]}], "images": [PIL]}
+    """
+
+    def __init__(self, processor, max_length: Optional[int] = None, focal_gamma: Optional[float] = None):
+        self.processor = processor
+        self.tokenizer = processor.tokenizer
+        self.image_processor = processor.image_processor
+        self.max_length = max_length
+        self.focal_gamma = focal_gamma if (focal_gamma is not None and 0.0 < focal_gamma < 1.0) else None
+        self.pad_token_id = self.tokenizer.pad_token_id
+        self._image_pad = "<|image_pad|>"
+
+    def _image_pattern(self, token_num: int) -> str:
+        return "<|vision_start|>" + self._image_pad * token_num + "<|vision_end|>"
+
+    def _encode_one(self, messages: List[Dict], image_token_nums: List[int]) -> Tuple[List[int], List[int]]:
+        """Tokenize one full trajectory message-by-message, returning (input_ids, labels)."""
+        input_ids: List[int] = []
+        labels: List[int] = []
+        image_index = 0
+        last_assistant_content = ""
+        focal_alpha = 1.0
+
+        for message in messages:
+            role = message["role"]
+            content = ""
+            for item in message.get("content", []):
+                if item.get("type") == "text":
+                    content += item.get("text", "")
+                elif item.get("type") == "image":
+                    content += self._image_pattern(image_token_nums[image_index])
+                    image_index += 1
+
+            loss_mask = 1 if role == "assistant" else 0
+            if role == "assistant" and self.focal_gamma is not None:
+                if last_assistant_content == content:
+                    focal_alpha *= self.focal_gamma
+                    if random.random() > focal_alpha:
+                        loss_mask = 0  # suppress this repeated action (VeOmni loss_mask=0)
+                else:
+                    focal_alpha = 1.0
+                last_assistant_content = content
+
+            if content == "":
+                content_str = "<|im_start|>" + role + "\n"
+            else:
+                content_str = "<|im_start|>" + role + "\n" + content.strip() + "<|im_end|>\n"
+
+            content_ids = self.tokenizer.encode(content_str, add_special_tokens=False)
+            input_ids += content_ids
+            if loss_mask == 1:
+                labels += content_ids
+            else:
+                labels += [IGNORE_INDEX] * len(content_ids)
+
+        return input_ids, labels
+
+    def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
+        # 1. Batch the images ONCE through the image processor (all samples' images
+        #    concatenated), then split the per-image token counts back per sample.
+        all_images: List[Image.Image] = []
+        sample_image_counts: List[int] = []
+        for ex in examples:
+            imgs = ex.get("images") or []
+            sample_image_counts.append(len(imgs))
+            all_images.extend(imgs)
+
+        pixel_values = None
+        image_grid_thw = None
+        token_nums: List[int] = []
+        if all_images:
+            ip_out = self.image_processor(all_images, return_tensors=None)
+            pixel_values = ip_out["pixel_values"]  # [total_patches, patch_dim]
+            image_grid_thw = ip_out["image_grid_thw"]  # [total_images, 3]
+            token_nums = [int(t * h * w) for t, h, w in image_grid_thw.tolist()]
+
+        # 2. Encode each sample message-by-message (VeOmni-style multi-step labels).
+        batch_input_ids: List[List[int]] = []
+        batch_labels: List[List[int]] = []
+        offset = 0
+        for ex, n_img in zip(examples, sample_image_counts):
+            sample_token_nums = token_nums[offset:offset + n_img]
+            offset += n_img
+            input_ids, labels = self._encode_one(ex["messages"], sample_token_nums)
+            if self.max_length is not None:
+                input_ids = input_ids[: self.max_length]
+                labels = labels[: self.max_length]
+            batch_input_ids.append(input_ids)
+            batch_labels.append(labels)
+
+        # 3. Pad to the batch max length.
+        max_len = max((len(ids) for ids in batch_input_ids), default=0)
+        pad_id = self.pad_token_id
+        padded_ids, padded_labels, padded_mask = [], [], []
+        for ids, lbls in zip(batch_input_ids, batch_labels):
+            pad_len = max_len - len(ids)
+            padded_ids.append(ids + [pad_id] * pad_len)
+            padded_labels.append(lbls + [IGNORE_INDEX] * pad_len)
+            padded_mask.append([1] * len(ids) + [0] * pad_len)
+
+        batch = {
+            "input_ids": torch.tensor(padded_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(padded_mask, dtype=torch.long),
+            "labels": torch.tensor(padded_labels, dtype=torch.long),
+        }
+        if pixel_values is not None:
+            batch["pixel_values"] = pixel_values
+            batch["image_grid_thw"] = image_grid_thw
+        return batch
+
+
 class _ImmutableVisionCollatorAdapter:
     """Give TRL's mutating VLM collator disposable sample containers.
 
@@ -1285,6 +1504,7 @@ def debug_dry_run(args):
         processor=processor,
         max_seq_length=args.max_seq_length,
         focal_gamma=args.focal_gamma,
+        full_trajectory=args.full_trajectory,
     )
 
     sft_config_field_names = {f.name for f in dataclass_fields(SFTConfig)}
@@ -1309,7 +1529,10 @@ def debug_dry_run(args):
         deepspeed=args.deepspeed,
         remove_unused_columns=False,
         packing=False,
-        completion_only_loss=True,
+        # full_trajectory mode computes multi-step labels in `_VeOmniAlignedVisionCollator`
+        # (which needs NO TRL-side loss masking); the default prompt/completion path needs
+        # completion_only_loss=True to mask the prompt/context out of the loss.
+        completion_only_loss=not args.full_trajectory,
         seed=args.seed,
         report_to=["none"],
         **max_len_kwarg,
@@ -1322,7 +1545,14 @@ def debug_dry_run(args):
         train_dataset=dataset,
         processing_class=processor,
     )
-    trainer.data_collator = _ImmutableVisionCollatorAdapter(trainer.data_collator)
+    if args.full_trajectory:
+        trainer.data_collator = _VeOmniAlignedVisionCollator(
+            processor=processor,
+            max_length=args.max_seq_length,
+            focal_gamma=args.focal_gamma,
+        )
+    else:
+        trainer.data_collator = _ImmutableVisionCollatorAdapter(trainer.data_collator)
     logger.info(f"Running trainer.train() for max_steps={args.debug_steps} with immutable VLM collator inputs...")
     trainer.train()
     logger.info(f"=== DRY RUN PASSED (SFTTrainer built + trained for {args.debug_steps} steps successfully) ===")
@@ -1449,8 +1679,21 @@ def main():
         "actions are skipped with keep-probability focal_gamma^k so long runs of a "
         "'safe' repeated action (e.g. move(0,0) while walking straight) cannot dominate "
         "the loss and collapse the model into always predicting that mode. 0.75 "
-        "replicates the official recipe; pass 1.0 (or 0) to disable. Only affects the "
-        "parquet/trajectory path (build_messages), not text_only/jsonl.",
+        "replicates the official recipe; pass 1.0 (or 0) to disable. In "
+        "--full_trajectory mode this is applied inside the collator as a per-step "
+        "loss-mask (exactly like VeOmni); otherwise it selects the completion turn at "
+        "sampling time. Only affects the parquet/trajectory path, not text_only/jsonl.",
+    )
+    parser.add_argument(
+        "--full_trajectory",
+        action="store_true",
+        default=False,
+        help="VeOmni-aligned Stage-III mode: keep the ENTIRE trajectory (system prompt + "
+        "instruction + every (image, action) step, no random history window) and compute "
+        "loss on EVERY assistant turn via _VeOmniAlignedVisionCollator (multi-step loss + "
+        "per-step focal suppression), instead of the default prompt/completion "
+        "completion_only_loss path. Requires parquet trajectory data; use a large "
+        "--max_seq_length (e.g. 19456, matching VeOmni) since trajectories are long.",
     )
     parser.add_argument("--max_seq_length", type=int, default=16384)
     parser.add_argument("--per_device_batch_size", type=int, default=2)
@@ -1619,6 +1862,7 @@ def main():
         processor=processor,
         max_seq_length=args.max_seq_length,
         focal_gamma=args.focal_gamma,
+        full_trajectory=args.full_trajectory,
     )
 
     # ── training config ──
@@ -1700,13 +1944,15 @@ def main():
         dataloader_num_workers=args.dataloader_num_workers,
         remove_unused_columns=False,
         packing=False,  # unsupported for VLMs, see argparse note above
-        # Loss must only be computed on the target "Action: ..." completion, not on the
-        # prompt (system prompt / history / current-step image+instruction). This is the
-        # VLM-supported equivalent of `assistant_only_loss` (which TRL rejects for vision
-        # datasets) -- it relies on `build_messages` splitting each sample into
-        # {"prompt": ..., "completion": [last assistant turn]} rather than a flat
-        # `messages` list.
-        completion_only_loss=True,
+        # Loss masking strategy:
+        #   - default prompt/completion path: only the target "Action: ..." completion is
+        #     trained on (the VLM-supported equivalent of `assistant_only_loss`, which TRL
+        #     rejects for vision datasets) -- relies on `build_messages` splitting each
+        #     sample into {"prompt": ..., "completion": [last assistant turn]}.
+        #   - --full_trajectory (VeOmni-aligned): every assistant turn is trained on via
+        #     `_VeOmniAlignedVisionCollator`, which builds the labels itself -- so TRL's
+        #     completion_only_loss must be OFF to avoid double-masking.
+        completion_only_loss=not args.full_trajectory,
         seed=args.seed,
         report_to=["wandb"] if os.environ.get("WANDB_API_KEY") else ["none"],
         run_name=os.environ.get("WANDB_RUN_NAME", "minecraft-sft-trl"),
@@ -1728,7 +1974,14 @@ def main():
         train_dataset=dataset,
         processing_class=processor,
     )
-    if not args.text_only:
+    if args.full_trajectory:
+        # VeOmni-aligned: multi-step assistant loss + focal, built by OUR collator.
+        trainer.data_collator = _VeOmniAlignedVisionCollator(
+            processor=processor,
+            max_length=args.max_seq_length,
+            focal_gamma=args.focal_gamma,
+        )
+    elif not args.text_only:
         trainer.data_collator = _ImmutableVisionCollatorAdapter(trainer.data_collator)
     if args.stall_dump_seconds > 0:
         trainer.add_callback(_HeartbeatCallback())
