@@ -54,7 +54,13 @@ trl @ git+https://github.com/huggingface/trl.git@24db2a825029f7e0e60f6d3c1604855
 datasets==5.0.1
 accelerate==1.14.0
 deepspeed>=0.15.0
-flash-attn>=2.6.0
+# Optional: --attn_implementation defaults to "sdpa" (no extra install). flash-attn's
+# prebuilt wheel was confirmed ABI-incompatible with the koala training image's torch
+# build (import-time "undefined symbol"), and building from source needs
+# `pip install --no-build-isolation flash-attn` (plain pip install fails to see the
+# already-installed torch inside its isolated build env). Only uncomment/install this
+# after verifying it actually imports on your target image.
+# flash-attn>=2.6.0
 wandb>=0.18.0
 Pillow>=10.0.0
 pyarrow>=17.0.0

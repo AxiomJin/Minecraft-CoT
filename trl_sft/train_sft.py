@@ -7,90 +7,57 @@ Data (two supported layouts, see `build_minecraft_dataset`):
 Model: s3://arcwm-code-us-west-2/axiom/model/Qwen3.5-9B/ (also works for Qwen2-VL /
     Qwen2.5-VL / Qwen3-VL under s3://arcwm-code-us-west-2/axiom/model/)
 
-Usage:
-    torchrun --nproc_per_node=$NPROC train_sft.py \
-        --model_path s3://arcwm-code-us-west-2/axiom/model/Qwen3.5-9B \
-        --data_path s3://arcwm-code-us-west-2/axiom/data/minecraft-text-action-dataset/data/train-*.parquet \
-        --output_dir ./output \
-        --max_turns 4 \
-        --max_seq_length 16384 \
-        --per_device_batch_size 2 \
-        --gradient_accumulation_steps 4 \
-        --num_train_epochs 1 \
-        --deepspeed ds_zero2.json
+See `launch.sh` for ready-to-run `debug`/`train` (Stage I/II)/`stage3` (Stage III,
+full-trajectory multi-step loss) invocations, including env bootstrap + S3 localization.
 
-    # jsonl / flat-QA layout (e.g. minecraft-vlp), --data_format auto-detected from the
-    # ".jsonl" extension; --image_root defaults to the directory containing --data_path:
+Usage (Stage II, prompt/completion, only the final "Action: ..." turn trained on):
     torchrun --nproc_per_node=$NPROC train_sft.py \
-        --model_path s3://arcwm-code-us-west-2/axiom/model/Qwen2-VL-7B-Instruct \
-        --data_path s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp/mc-vqa-241102.jsonl \
-        --output_dir ./output
+        --model_path s3://.../Qwen3.5-9B --output_dir ./output \
+        --data_path s3://.../minecraft-text-action-dataset/data/train-*.parquet \
+        --max_turns 4 --max_seq_length 16384 \
+        --per_device_batch_size 2 --gradient_accumulation_steps 4 \
+        --num_train_epochs 1 --deepspeed ds_zero2.json
 
-    # Stage I (JARVIS-VLA "Minecraft world knowledge" text-only post-training): rows
-    # are plain system+user+assistant text QA with no images at all (e.g.
-    # minecraft-vlp/mc-qa-*.jsonl, label=["qa","wiki","self-instruct"]). --text_only
-    # makes samples carry no "images" key (so SFTTrainer uses its plain-text collator,
-    # not the vision one) and --freeze_vision_tower keeps the ViT+adapter frozen while
-    # only the LLM backbone is updated. Hyperparameters below match JARVIS-VLA's paper
-    # recipe as closely as feasible (LR=5e-6, AdamW beta2=0.95/wd=0, fixed 200-step
-    # warmup, grad-norm clip 1.0, global batch=256, DeepSpeed ZeRO-1, max_length=3584,
-    # seed=42) -- EXCEPT for two deliberate deviations:
-    #   (a) --gradient_accumulation_steps is scaled up from the paper's 4 to compensate
-    #       for using 8 GPUs here instead of the paper's 32 (2*16*8 = 2*4*32 = 256, so
-    #       the *effective* global batch is identical, training just takes longer
-    #       wall-clock);
-    #   (b) ds_zero1.json defines an EXPLICIT DeepSpeed-native "WarmupDecayLR" scheduler
-    #       with HARDCODED warmup_min_lr=0/warmup_max_lr=5e-6/warmup_num_steps=200/
-    #       total_num_steps=1077 (matching --learning_rate/--warmup_steps/--max_steps
-    #       below) rather than "auto"-filling those or letting --lr_scheduler_type=cosine
-    #       run as a plain HF scheduler under DeepSpeed. Both alternatives were tried
-    #       and empirically failed on this exact stack (transformers+deepspeed+
-    #       grad-accum=16): the plain-HF-scheduler-under-DeepSpeed path completed warmup
-    #       ~5-16x faster than the requested 200 steps, and "auto"-filling
-    #       scheduler.params.warmup_num_steps resolved via --warmup_ratio (not
-    #       --warmup_steps) and crashed with warmup_num_steps=0 once --warmup_ratio was
-    #       forced to 0 to disambiguate the first issue. Hardcoding the scheduler section
-    #       sidesteps both: reuse this ds_zero1.json for a *different* max_steps/lr/
-    #       warmup_steps combination requires updating it to match. The one remaining
-    #       deviation from the paper this introduces: WarmupDecayLR decays LINEARLY
-    #       after warmup, not via the paper's cosine schedule.
+    # jsonl / flat-QA layout (e.g. minecraft-vlp); --data_format auto-detects from the
+    # ".jsonl" extension, --image_root defaults to the dir containing --data_path:
+    torchrun --nproc_per_node=$NPROC train_sft.py \
+        --model_path s3://.../Qwen2-VL-7B-Instruct --output_dir ./output \
+        --data_path s3://.../minecraft-vlp/mc-vqa-241102.jsonl
+
+    # Stage I (JARVIS-VLA "world knowledge" text-only post-training): plain text QA,
+    # no images (e.g. mc-qa-*.jsonl). --text_only omits the "images" key entirely (so
+    # SFTTrainer uses its plain-text collator) and --freeze_vision_tower keeps ViT+
+    # adapter frozen. Hyperparameters below match the paper (LR=5e-6, beta2=0.95/wd=0,
+    # 200-step warmup, global batch=256, ZeRO-1) except grad_accum is scaled up 4x to
+    # compensate for 8 GPUs here vs. the paper's 32 (same effective global batch, just
+    # slower wall-clock); ds_zero1.json hardcodes its WarmupDecayLR schedule to match
+    # --warmup_steps/--max_steps below (a plain HF scheduler under DeepSpeed was found
+    # to blow through warmup 5-16x faster than requested on this stack -- update the
+    # json if you change those args).
     torchrun --nproc_per_node=8 train_sft.py \
-        --model_path s3://arcwm-code-us-west-2/axiom/model/Qwen3.5-9B \
-        --data_path s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp/mc-qa-250312.jsonl \
-        --text_only \
-        --freeze_vision_tower \
-        --max_seq_length 3584 \
-        --per_device_batch_size 2 \
-        --gradient_accumulation_steps 16 \
-        --num_train_epochs 1 \
-        --max_steps 1077 \
-        --learning_rate 5e-6 \
-        --lr_scheduler_type cosine \
-        --warmup_steps 200 \
-        --weight_decay 0.0 \
-        --adam_beta1 0.9 \
-        --adam_beta2 0.95 \
-        --adam_epsilon 1e-8 \
-        --max_grad_norm 1.0 \
-        --seed 42 \
-        --deepspeed ds_zero1.json \
-        --output_dir ./output
+        --model_path s3://.../Qwen3.5-9B --output_dir ./output \
+        --data_path s3://.../minecraft-vlp/mc-qa-250312.jsonl \
+        --text_only --freeze_vision_tower \
+        --max_seq_length 3584 --per_device_batch_size 2 --gradient_accumulation_steps 16 \
+        --num_train_epochs 1 --max_steps 1077 --learning_rate 5e-6 --lr_scheduler_type cosine \
+        --warmup_steps 200 --weight_decay 0.0 --adam_beta2 0.95 --max_grad_norm 1.0 \
+        --seed 42 --deepspeed ds_zero1.json
+
+    # Stage III (full-trajectory multi-step loss): see --full_trajectory below.
 
 NOTE on VLM + TRL:
-  - All target models (Qwen2-VL / Qwen2.5-VL / Qwen3-VL / Qwen3.5-VL) are vision-language
-    models. TRL's `SFTTrainer` picks the vision-language data collator
-    (`DataCollatorForVisionLanguageModeling`) only when a sample dict has a top-level
-    "images" (or "image") key.
-      * `packing=True` is not supported for VLMs by TRL and will raise at trainer init time.
-      * `assistant_only_loss=True` is ALSO not supported for vision datasets -- TRL raises
-        `ValueError` for it at trainer init time (`DataCollatorForVisionLanguageModeling`
-        has no `assistant_masks` handling at all, it only masks padding).
-  - Loss masking strategy actually used here: each sample is split into
-    {"prompt": [...history/context...], "completion": [last assistant turn only],
-    "images": [...]} (TRL's *conversational prompt-completion* format) and
-    `SFTConfig(completion_only_loss=True)` is set below. This IS supported for VLMs
-    (`_collate_prompt_completion`) and gives exactly what we want: loss is only computed
-    on the target "Action: ..." turn, never on the system prompt / history / image tokens.
+  - All target models are vision-language models, so TRL's `SFTTrainer` always picks
+    `DataCollatorForVisionLanguageModeling` (triggered by a top-level "images" key).
+    That collator does not support `packing=True` or `assistant_only_loss=True` for
+    VLMs (both raise `ValueError` at trainer-init time) -- so this script uses one of
+    two loss-masking strategies instead:
+      * default: split each sample into {"prompt": [...context...], "completion":
+        [last assistant turn]} + `SFTConfig(completion_only_loss=True)`, which TRL DOES
+        support for VLMs (`_collate_prompt_completion`) -- loss only on the target
+        "Action: ..." turn.
+      * --full_trajectory: keep the WHOLE trajectory as one flat `messages` list and
+        let `_MultiStepVLMCollator` (subclasses `DataCollatorForVisionLanguageModeling`)
+        mask every non-assistant token to -100 itself, training on EVERY assistant turn.
 """
 
 from __future__ import annotations
@@ -114,15 +81,12 @@ import torch
 from datasets import concatenate_datasets, load_dataset
 from transformers import AutoModelForImageTextToText, AutoProcessor, TrainerCallback, set_seed
 from trl import SFTConfig, SFTTrainer
+from trl.trainer.sft_trainer import DataCollatorForVisionLanguageModeling
 from PIL import Image
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 logger = logging.getLogger(__name__)
-
-# HuggingFace / VeOmni convention for "do not compute loss on this token". Used by the
-# VeOmni-aligned collator below to mask every token that is not an assistant turn.
-IGNORE_INDEX = -100
 
 
 # ─── hang diagnostics ──────────────────────────────────────────────────────────
@@ -239,20 +203,13 @@ def _local_cache_name(s3_or_local_path: str) -> str:
 def download_from_s3(s3_path: str, local_dir: str, exclude_checkpoints: bool = False) -> str:
     """Download model/dataset from S3 to local disk, skip if already exists.
 
-    `exclude_checkpoints=True` skips any `checkpoint-*/` subdirectory. This matters when
-    `s3_path` is a model dir produced by a PREVIOUS run of this script used as the
-    starting point for a later stage (e.g. loading a Stage I output dir to start Stage
-    II): `--output_dir` (and hence the uploaded model dir) contains both the final
-    merged model at the root (config.json/model.safetensors/tokenizer.*, all that
-    `from_pretrained` ever reads) AND every intermediate `--save_steps` checkpoint
-    (each one a full DeepSpeed ZeRO checkpoint with fp32 optimizer state -- for a 9B
-    model that's ~5x the plain model size, PER checkpoint, and `--save_total_limit`
-    keeps up to 5 of them). Downloading those checkpoint dirs alongside the root is
-    pure waste: verified on the real Qwen3.5-9B-stage1-16gpu output (475GB total, only
-    18.8GB of it is the root-level files `from_pretrained` will actually load; the
-    other 456GB is 5 checkpoint-*/ dirs full of *_optim_states.pt / mp_rank_*.pt
-    shards). Harmless / a no-op for base model dirs that don't have any checkpoint-*
-    subdirs in the first place.
+    `exclude_checkpoints=True` skips any `checkpoint-*/` subdirectory -- relevant when
+    `s3_path` is a PREVIOUS run's `--output_dir` used as the next stage's starting
+    model: it contains both the final merged model at the root (everything
+    `from_pretrained` reads) AND every intermediate `--save_steps` checkpoint (a full
+    DeepSpeed ZeRO checkpoint with fp32 optimizer state, ~5x the plain model size each,
+    up to `--save_total_limit` of them). Downloading those is pure waste (verified: one
+    real 9B-model output dir was 475GB total, only 18.8GB of it actually needed).
     """
     local_dir = Path(local_dir)
     marker = local_dir / ".download_complete"
@@ -275,68 +232,37 @@ def download_from_s3(s3_path: str, local_dir: str, exclude_checkpoints: bool = F
 # ─── dataset helpers ──────────────────────────────────────────────────────────
 
 
-def _assistant_action_text(conversations: list, turn: int) -> str:
-    """Return the concatenated text of the assistant message of the given zero-based
-    trajectory turn, used to detect consecutive IDENTICAL actions for focal suppression.
-
-    ``conversations`` follows the strict ``[user_0, assistant_0, user_1, assistant_1,
-    ...]`` layout (the pairing `build_messages` establishes after dropping any stray
-    leading turn), so the assistant of turn ``t`` lives at index ``2*t + 1``. Non-text
-    content items are skipped (action turns in `minecraft-text-action-dataset` are pure
-    text: ``Action: move(...) and press(...)``), so the result is effectively the full
-    action string used for equality comparison.
-    """
-    if not conversations or 2 * turn + 1 >= len(conversations):
-        return ""
-    content = conversations[2 * turn + 1].get("content", [])
-    if isinstance(content, str):
-        return content
-    parts = []
-    for item in content:
-        if isinstance(item, dict) and item.get("type") == "text":
-            parts.append(item.get("text", ""))
-    return "".join(parts)
-
-
 def build_messages(
     conversations: list,
     image_bytes_list: list,
     max_turns: int,
     rng: Optional[random.Random] = None,
-    focal_gamma: Optional[float] = None,
 ) -> Tuple[Optional[List[Dict]], Optional[List[Dict]], Optional[List[Image.Image]]]:
     """
     Convert a single parquet row into TRL's conversational *prompt-completion* format:
     (prompt, completion, images).
 
-    Only the LAST assistant turn is the actual training target ("Action: ..."); every
-    turn before it (system prompt / history / current-step image+instruction) is context
-    that must NOT contribute to the loss. Splitting into prompt/completion (rather than a
-    single flat `messages` list) lets `SFTConfig(completion_only_loss=True)` mask the
-    context out -- this is the only loss-masking mechanism TRL currently supports for
-    vision-language datasets (`assistant_only_loss` raises `ValueError` for VLMs).
+    Only the LAST assistant turn is the training target ("Action: ..."); everything
+    before it is context that must NOT contribute to the loss. Splitting into
+    prompt/completion (rather than a flat `messages` list) lets
+    `SFTConfig(completion_only_loss=True)` mask the context out -- the only
+    loss-masking TRL currently supports for VLM datasets (`assistant_only_loss` raises
+    for VLMs).
 
     Args:
         conversations: list of {role, content[{type, text/image}]}
         image_bytes_list: list of JPEG bytes, one per user turn (with image)
         max_turns: maximum number of (user, assistant) pairs to include
-        rng: `random.Random` instance to draw the history-length sample from. Defaults to
-            the global `random` module (fine for single-threaded/debug use, but callers
-            with per-sample determinism needs -- e.g. `_row_to_trl_sample` -- should
-            pass their own local instance instead of relying on/mutating global state).
-        focal_gamma: focal repeated-action suppression rate (OpenHA Stage-III recipe).
-            Consecutive identical assistant actions are skipped with keep-probability
-            ``focal_gamma**k`` so long runs of a "safe" repeated action (e.g.
-            ``move(0, 0)`` while walking) can't dominate the loss. ``None`` or any value
-            outside ``(0, 1)`` disables it (completion is always the last turn).
+        rng: `random.Random` for the history-length sample. Defaults to the global
+            `random` module; callers needing per-sample determinism (e.g.
+            `_row_to_trl_sample`) should pass their own instance.
 
     Returns:
-        (prompt, completion, images):
-          - prompt: all turns except the final assistant turn.
-          - completion: single-element list containing only the final assistant message.
-          - images: flat, ordered list of decoded `PIL.Image` objects matching the
-            `{"type": "image"}` placeholders inside `prompt` (this must be passed as the
-            top-level "images" key of the dataset sample, NOT embedded in `content`).
+        (prompt, completion, images): `prompt` is every turn except the final
+        assistant turn; `completion` is a single-element list with just that turn;
+        `images` is the flat, ordered list of decoded `PIL.Image`s matching `prompt`'s
+        `{"type": "image"}` placeholders (pass as the sample's top-level "images" key,
+        not embedded in `content`).
     """
     rng = rng if rng is not None else random
     if not conversations or len(conversations) < 2:
@@ -352,67 +278,22 @@ def build_messages(
     # Count total turns
     total_turns = len(conversations) // 2
 
-    # --- focal: pick the completion turn, suppressing consecutive identical actions ---
-    # OpenHA's official Stage-III recipe (`Qwen2_5VLFocalChatTemplate`) downweights /
-    # probabilistically masks consecutive IDENTICAL assistant actions at a `0.75**k`
-    # geometric rate, so long runs of a "safe" repeated action -- most importantly
-    # `Action: move(0, 0) and press(...)` while walking straight -- cannot dominate the
-    # loss and collapse the model into always predicting that mode (the exact failure we
-    # observed: our earlier Stage-III checkpoints output `move(0,0)` ~99.5% of the time).
-    # Our single-completion architecture (only the LAST assistant turn is the training
-    # target) has no per-step loss-mask, so we reproduce the same suppression at sampling
-    # time instead: walk backwards from the trajectory tail and, for each action identical
-    # to its predecessor, probabilistically skip it (keep probability `focal_gamma**k`) so
-    # the completion lands on an action *change* point rather than another repeated frame.
-    completion_turn = total_turns - 1
-    if focal_gamma is not None and 0.0 < focal_gamma < 1.0:
-        # Exactly replicate OpenHA's `Qwen2_5VLFocalChatTemplate` focal_alpha
-        # accumulation: alpha *= focal_gamma when an action equals its predecessor
-        # (so the 1st repeat after a change point is 0.75, the 2nd 0.5625, ...), and
-        # reset to 1.0 when the action changes. A change point's alpha is always 1.0.
-        alphas = [1.0] * total_turns
-        alpha = 1.0
-        for t in range(1, total_turns):
-            if _assistant_action_text(conversations, t - 1) == _assistant_action_text(conversations, t):
-                alpha *= focal_gamma
-            else:
-                alpha = 1.0
-            alphas[t] = alpha
-        # Walk backwards from the trajectory tail: a change point (alpha=1.0) is always
-        # kept; a repeated action is kept with probability `alphas[t]` (= focal_gamma**k,
-        # k = its position inside the run), otherwise skipped. The completion therefore
-        # lands preferentially on an action *change* point, suppressing long runs of a
-        # repeated action (e.g. move(0,0) while walking straight) from dominating the loss.
-        turn = total_turns - 1
-        while turn > 0:
-            if alphas[turn] >= 1.0 or rng.random() < alphas[turn]:
-                break  # keep this turn
-            turn -= 1  # skip this repeated action, keep scanning backwards
-        completion_turn = turn
-
-    # Random history length: 0 to min(completion_turn, max_turns)
-    max_possible = min(completion_turn, max_turns)
+    # Random history length: 0 to min(total_turns-1, max_turns)
+    max_possible = min(total_turns - 1, max_turns)
     if max_possible < 0:
         return None, None, None
     history_len = rng.randint(0, max_possible)
 
-    # Take the last (history_len + 1) turns ending at completion_turn
-    start_turn = completion_turn - history_len
+    # Take the last (history_len + 1) turns
+    start_turn = total_turns - (history_len + 1)
     start_idx = start_turn * 2
 
-    if completion_turn == total_turns - 1:
-        # completion is the trajectory's true last turn -> slice through the end of the
-        # list (identical to the pre-focal behavior, and robust to odd-length lists)
-        selected_convs = conversations[start_idx:]
-        # NOTE: this slices `image_bytes_list` by *pair index* (`start_turn`), which
-        # matches `minecraft-text-action-dataset`'s parquet schema: exactly one
-        # `image_bytes` entry per (user, assistant) trajectory step. See
-        # `build_messages_qa` for the FLAT/no-slicing indexing used by the jsonl format.
-        selected_image_bytes = image_bytes_list[start_turn:] if image_bytes_list else []
-    else:
-        # focal skipped some trailing repeated turns -> truncate at completion_turn
-        selected_convs = conversations[start_idx:(completion_turn * 2 + 2)]
-        selected_image_bytes = image_bytes_list[start_turn:(completion_turn + 1)] if image_bytes_list else []
+    selected_convs = conversations[start_idx:]
+    # NOTE: this slices `image_bytes_list` by *pair index* (`start_turn`), which matches
+    # `minecraft-text-action-dataset`'s parquet schema: exactly one `image_bytes` entry
+    # per (user, assistant) trajectory step. See
+    # `build_messages_qa` for the FLAT/no-slicing indexing used by the jsonl format.
+    selected_image_bytes = image_bytes_list[start_turn:] if image_bytes_list else []
 
     return _split_prompt_completion_with_images(selected_convs, selected_image_bytes)
 
@@ -422,14 +303,12 @@ def _split_prompt_completion_with_images(
     image_bytes_list: List[bytes],
 ) -> Tuple[List[Dict], List[Dict], List[Image.Image]]:
     """
-    Shared tail used by both `build_messages` (trajectory/parquet rows) and
+    Shared tail used by `build_messages` (parquet trajectory rows) and
     `build_messages_qa` (flat QA/jsonl rows): walks `conversations`, keeps
-    `{"type": "image"}` placeholders in-place (to preserve text/image interleaving
-    order) while decoding the matching entry of the FLAT `image_bytes_list` (one entry
-    per placeholder, in encounter order across the whole `conversations` list -- NOT
-    per-turn) into a separate flat `images` list. Finally splits off the final
-    assistant turn as `completion`; everything before it becomes `prompt` (context that
-    `SFTConfig(completion_only_loss=True)` will mask out of the loss).
+    `{"type": "image"}` placeholders in-place while decoding the matching entry of the
+    flat `image_bytes_list` (one entry per placeholder, in encounter order across the
+    whole conversation) into a separate `images` list. Finally splits off the final
+    assistant turn as `completion`, with everything before it as `prompt`.
     """
     messages = []
     images: List[Image.Image] = []
@@ -475,22 +354,12 @@ def _split_prompt_completion_with_images(
     # becomes the `prompt` (context that `completion_only_loss` will mask out).
     prompt, completion = messages[:-1], [messages[-1]]
 
-    # Defensive invariant check: TRL's collator (`trl.data_utils.prepare_multimodal_messages`,
-    # called on `example["prompt"]`/`example["images"]` inside `SFTTrainer`'s
-    # `torch_call`) requires the number of `{"type": "image"}` placeholders WITHIN
-    # `prompt` to exactly equal `len(images)` (the flat image list accumulated above
-    # across the WHOLE conversation, prompt- and completion-side alike) -- otherwise it
-    # raises `ValueError: Number of images provided (N) does not match number of image
-    # placeholders (M)`. Observed in practice: this crashed two separate live 16-GPU
-    # Stage II jobs ~13h in, once a `DataLoader` worker's shuffled iteration order
-    # finally landed on the one bad row out of hundreds of thousands. Root cause is a
-    # small minority of mislabeled rows in the underlying jsonl data where an image
-    # placeholder ends up in the FINAL (assistant) turn -- which becomes `completion`,
-    # not `prompt` -- so that image's matching placeholder is invisible to `prompt`'s
-    # count even though `images` (built across the whole conversation) still includes
-    # it. Checking this invariant up front, at dataset-construction time, converts a
-    # "crash the whole distributed job hours into training" failure into a "silently
-    # drop this one malformed row" outcome instead.
+    # TRL's collator requires #`{"type":"image"}` placeholders WITHIN `prompt` to equal
+    # `len(images)`, or it raises mid-training. A small minority of source rows put an
+    # image placeholder in the FINAL (assistant) turn -- which becomes `completion`, not
+    # `prompt` -- so that placeholder goes uncounted while `images` still includes it.
+    # Caught two real 16-GPU jobs crashing ~13h in on the one bad row out of hundreds of
+    # thousands; checking here converts that into a silent per-row drop instead.
     num_prompt_placeholders = sum(
         1 for m in prompt for item in m["content"] if item.get("type") == "image"
     )
@@ -504,38 +373,25 @@ def _split_prompt_completion_with_images(
     return prompt, completion, images
 
 
-def build_full_trajectory(
+def _build_full_trajectory(
     conversations: List[Dict],
     image_bytes_list: List[bytes],
 ) -> Tuple[Optional[List[Dict]], Optional[List[Image.Image]]]:
-    """
-    Convert ONE parquet trajectory row into the VeOmni-aligned *full-trajectory* format:
-    the COMPLETE `messages` list (system prompt + instruction + every (image, action)
-    step, nothing truncated) plus the flat decoded `images` list.
+    """One parquet trajectory row -> full (messages, images) for multi-step loss.
 
-    Unlike `build_messages` (which samples a random history window and splits off only
-    the final assistant turn as the training target for `completion_only_loss`), this
-    keeps EVERY turn. Combined with `_VeOmniAlignedVisionCollator` it reproduces
-    OpenHA's official Stage-III recipe: every assistant "Action: ..." turn contributes
-    to the loss (multi-step loss), `{"type": "image"}` placeholders stay in-place inside
-    `messages` while their decoded pixels go into the top-level `images` list in
-    encounter order, and consecutive identical actions are focal-suppressed inside the
-    collator (not at sampling time as `build_messages` does).
+    Mirrors `_split_prompt_completion_with_images` (same content normalization + image
+    decode) but keeps the WHOLE conversation: no prompt/completion split, so every
+    assistant "Action: ..." turn stays a training target for `_MultiStepVLMCollator`.
     """
     if not conversations or len(conversations) < 2:
         return None, None
-    # Same stray-leading-turn guard as `build_messages`: drop a non-user first turn so
-    # the [user_0, assistant_0, user_1, assistant_1, ...] pairing stays aligned.
     if conversations[0]["role"] != "user":
         conversations = conversations[1:]
     if not conversations or conversations[-1]["role"] != "assistant":
         return None, None
 
-    messages = []
-    images: List[Image.Image] = []
-    image_idx = 0
+    messages, images, image_idx = [], [], 0
     for conv in conversations:
-        role = conv["role"]
         content_list = []
         for item in conv["content"]:
             if item.get("type") == "text":
@@ -543,15 +399,13 @@ def build_full_trajectory(
             elif item.get("type") == "image":
                 if image_idx < len(image_bytes_list):
                     try:
-                        img = Image.open(io.BytesIO(image_bytes_list[image_idx])).convert("RGB")
+                        images.append(Image.open(io.BytesIO(image_bytes_list[image_idx])).convert("RGB"))
                         content_list.append({"type": "image"})
-                        images.append(img)
                     except Exception as e:
                         logger.warning(f"Failed to decode image at idx {image_idx}: {e}")
                         content_list.append({"type": "text", "text": "[image]"})
                 image_idx += 1
-        messages.append({"role": role, "content": content_list})
-
+        messages.append({"role": conv["role"], "content": content_list})
     return messages, images
 
 
@@ -663,38 +517,19 @@ def build_messages_text_only(conversations: list) -> Tuple[Optional[List[Dict]],
     return prompt, completion
 
 
-# TRL's `SFTTrainer` tokenizes `prompt` alone (with `add_generation_prompt=True`) and
-# `prompt + completion` together, then checks that the former is a token-for-token
-# PREFIX of the latter to compute `completion_mask` (see
-# "Mismatch between tokenized prompt..." warning). For any Qwen3.x-family "thinking"
-# chat template, leaving `enable_thinking` unset makes these two renderings literally
-# different strings at the assistant turn: `add_generation_prompt=True` alone emits an
-# UNCLOSED `<think>\n`, while the full prompt+completion render (assistant turn with
-# empty `reasoning_content`) emits a CLOSED `<think>\n\n</think>\n\n`. Text-wise the
-# former IS a character-prefix of the latter, but the tokenizer is not prefix-stable
-# across that specific `\n`+`\n` boundary (verified against the real Qwen3.5-9B
-# tokenizer: "<think>\n" tokenizes with a trailing lone `\n` token, but the same
-# characters as a prefix of "<think>\n\n</think>\n\n..." get merged into a single
-# double-newline token) -- so `len(prompt_ids)` ends up 2 tokens short of the true
-# prompt/completion boundary, and those 2 boilerplate tokens (`</think>` + the
-# following blank line) leak into the loss on every single sample. Passing
-# `enable_thinking=False` explicitly makes `add_generation_prompt=True` ALSO emit the
-# closed `<think>\n\n</think>\n\n` form, so both renderings share the exact same
-# literal string at the boundary and tokenize identically -- eliminates the mismatch
-# (verified with the real tokenizer).
+# TRL's `SFTTrainer` checks that tokenized `prompt` is a token-for-token PREFIX of
+# tokenized `prompt+completion` to compute `completion_mask`. For Qwen3.x "thinking"
+# chat templates, leaving `enable_thinking` unset breaks that: `add_generation_prompt=
+# True` alone emits an unclosed `<think>\n`, while the full render's assistant turn
+# emits a closed `<think>\n\n</think>\n\n` -- character-prefix but NOT token-prefix
+# (verified: the tokenizer merges that boundary differently), so 2 boilerplate tokens
+# leak into the loss on every sample. `enable_thinking=False` makes both renderings
+# emit the same closed form, eliminating the mismatch.
 #
-# Only actually apply it (see `_resolve_chat_template_kwargs` below) when the loaded
-# processor's own chat template references `enable_thinking` at all (Qwen3.x): passing
-# it unconditionally to a template that doesn't (e.g. Qwen2-VL/Qwen2.5-VL) still
-# renders byte-identically (Jinja silently ignores unused template variables), but
-# `transformers`' `apply_chat_template` does its OWN separate check -- via Jinja
-# template introspection (`_get_template_variables`) -- to decide which of its
-# `**kwargs` are "real" template variables vs. mistakenly-misplaced `processor_kwargs`;
-# `enable_thinking` not appearing in that template's variable list makes it match the
-# latter and trips `logger.warning("Kwargs passed to \`processor.__call__\` have to be
-# in \`processor_kwargs\` dict, not in \`**kwargs\`")` on EVERY `apply_chat_template`
-# call (i.e. once per sample, every step) -- purely cosmetic log spam, but avoiding it
-# outright is simplest.
+# Only applied (see `_resolve_chat_template_kwargs`) when the processor's template
+# actually references `enable_thinking` (Qwen3.x): passing it to a template that
+# doesn't (Qwen2-VL/Qwen2.5-VL) renders identically but trips a per-sample
+# `transformers` "kwargs not in processor_kwargs" warning -- avoided by gating on it.
 _CHAT_TEMPLATE_KWARGS: Dict = {"enable_thinking": False}
 
 
@@ -726,63 +561,37 @@ def _row_to_trl_sample(
     text_only: bool = False,
     processor=None,
     max_seq_length: Optional[int] = None,
-    focal_gamma: Optional[float] = None,
     full_trajectory: bool = False,
 ) -> Dict:
     """
     Map ONE raw dataset row (parquet trajectory step OR jsonl QA session, per
     `data_format`) to a TRL prompt/completion/images sample.
 
-    This is used as the `function` argument of `datasets.Dataset.map` /
-    `datasets.IterableDataset.map` (with `with_indices=True`) rather than being wrapped
-    in a hand-rolled `torch.utils.data.IterableDataset` subclass. That distinction
-    matters: `trl.SFTTrainer.__init__` only accepts a `train_dataset` that
-    `isinstance`-checks against `datasets.Dataset` / `datasets.IterableDataset` --
-    a custom `torch.utils.data.IterableDataset` iterates fine on its own but is
-    rejected with `TypeError` at trainer-construction time. Chaining `.map()` on the
-    object returned by `datasets.load_dataset(...)` keeps the result a genuine
-    `datasets.Dataset` / `datasets.IterableDataset`, so it passes that check and
-    remains shardable by SFTTrainer/Accelerate at DataLoader preparation time.
+    Used as the `function` arg of `datasets.Dataset.map`/`IterableDataset.map` (with
+    `with_indices=True`), not a hand-rolled `torch.utils.data.IterableDataset`:
+    `SFTTrainer.__init__` requires `train_dataset` to `isinstance`-check against
+    `datasets.Dataset`/`IterableDataset`, and chaining `.map()` on `load_dataset(...)`'s
+    return value preserves that (plus SFTTrainer/Accelerate's sharding).
 
-    For `data_format == "parquet"` (`minecraft-text-action-dataset`-style trajectory
-    rows), uses a *local* RNG keyed by the sample's own stable "id" (not `idx`, the
-    stream-position/row index) so that (a) process/worker sharding cannot change a
-    sample's history choice merely by resetting a local stream position to 0 and
-    (b) we don't mutate the global `random` module state as a side effect. For
-    `data_format == "jsonl"` (`minecraft-vlp`-style flat QA rows,
-    `build_messages_qa`) there is no history sampling, so no RNG is needed.
+    For parquet rows, uses a *local* RNG keyed by the sample's stable "id" (not `idx`)
+    so process/worker sharding can't change a sample's history choice, and the global
+    `random` module state isn't mutated as a side effect.
 
-    If `text_only=True` (Stage I, see `--text_only`), this bypasses `build_messages`/
-    `build_messages_qa` entirely in favor of `build_messages_text_only`, and the
-    returned dict has NO "images" key at all -- not even an empty list. That distinction
-    matters just as much as the `datasets`-type one above: `SFTTrainer` picks its
-    vision-language collator purely based on whether an "images"/"image" column is
-    *present* on the dataset (regardless of whether it's populated), so omitting the
-    key entirely is what makes Stage I run as ordinary text-only LM fine-tuning instead
-    of (incorrectly) going through the vision collator with empty image lists.
+    `text_only=True` (Stage I) bypasses `build_messages`/`build_messages_qa` for
+    `build_messages_text_only`, and the returned dict has NO "images" key at all --
+    `SFTTrainer` picks its vision collator purely based on whether that key is
+    *present*, so omitting it (not just leaving it empty) is what keeps Stage I on the
+    plain-text path.
 
-    Invalid rows are flagged via `"_keep": False` instead of being dropped here (a
-    `.map()` function must return exactly one output row per input row); the caller
-    chains `.filter(lambda x: x["_keep"])` afterwards to actually drop them.
+    Invalid rows get `"_keep": False` (a `.map()` fn must return one row per input row);
+    the caller chains `.filter(lambda x: x["_keep"])` to actually drop them.
 
-    If `processor` and `max_seq_length` are both given, image-bearing samples also get
-    a `_keep=False` pre-filter based on their REAL tokenized length (see
-    `_exceeds_max_length`) -- this guards against a crash that is otherwise silent
-    until it kills a whole multi-GPU job partway through training: `SFTConfig`'s
-    `max_length`/`max_seq_length` truncation happens at the raw-token level with no
-    awareness of where each image's placeholder-token block starts/ends, so an
-    oversized multi-image sample (e.g. `mc-grounding-point-embodied-image5.jsonl`'s
-    5-image rows) can get truncated *through the middle* of an image's placeholder
-    tokens. The VLM's forward pass then finds the (untruncated) vision-tower feature
-    count no longer matches the (truncated) placeholder-token count still in
-    `input_ids` and raises `ValueError: Image features and image tokens do not
-    match, tokens: N, features: M` -- observed in practice for Qwen2-VL-7B on this
-    Stage II data.
-
-    For trajectory (parquet) rows the overflow is resolved by *trimming the sampled
-    history* until the sample fits. This preserves one output sample per input row in
-    the normal path, minimizing differences in effective shard lengths after
-    Accelerate performs the one and only process-level split.
+    If `processor`/`max_seq_length` are given, image-bearing samples are also
+    length-checked (`_exceeds_max_length`) -- otherwise `SFTConfig`'s raw-token-level
+    truncation can land inside an image's placeholder-token block, and the VLM forward
+    pass crashes with a tokens/features mismatch (observed for real on Qwen2-VL-7B).
+    For trajectory rows the fix is to trim the sampled history until it fits, instead
+    of dropping the row outright.
     """
     sample_id = sample.get("id", idx)
     chat_template_kwargs = _resolve_chat_template_kwargs(processor)
@@ -797,6 +606,20 @@ def _row_to_trl_sample(
             "_keep": True,
         }
 
+    if full_trajectory:
+        # Stage III multi-step loss: keep the whole parquet trajectory as a flat
+        # `messages` list (not prompt/completion) so `_MultiStepVLMCollator` trains on
+        # every assistant turn. Oversized trajectories are dropped (same rationale as
+        # the prompt/completion path below: truncation through a vision-token block
+        # crashes the forward pass).
+        messages, images = _build_full_trajectory(sample["conversations"], sample.get("image_bytes", []))
+        if messages is None:
+            return {"messages": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
+        if images and processor is not None and max_seq_length is not None:
+            if _exceeds_max_length(processor, messages[:-1], [messages[-1]], images, max_seq_length, chat_template_kwargs):
+                return {"messages": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
+        return {"messages": messages, "images": images, "chat_template_kwargs": chat_template_kwargs, "_keep": True}
+
     if data_format == "jsonl":
         prompt, completion, images = build_messages_qa(
             conversations=sample["conversations"],
@@ -809,34 +632,15 @@ def _row_to_trl_sample(
             if _exceeds_max_length(processor, prompt, completion, images, max_seq_length, chat_template_kwargs):
                 return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
     else:
-        if full_trajectory:
-            # VeOmni-aligned Stage-III mode: keep the ENTIRE trajectory (system prompt +
-            # instruction + every (image, action) step), no random history window. The
-            # multi-step loss + focal suppression happen later in `_VeOmniAlignedVisionCollator`,
-            # not here. Oversized trajectories are dropped defensively (same rationale as
-            # the prompt/completion path below: truncation through a vision-token block
-            # crashes the forward pass).
-            messages, images = build_full_trajectory(
-                conversations=sample["conversations"],
-                image_bytes_list=sample.get("image_bytes", []),
-            )
-            if messages is None:
-                return {"messages": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
-            if images and processor is not None and max_seq_length is not None:
-                if _exceeds_max_length(processor, messages[:-1], [messages[-1]], images, max_seq_length, chat_template_kwargs):
-                    return {"messages": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
-            return {"messages": messages, "images": images, "chat_template_kwargs": chat_template_kwargs, "_keep": True}
-
         def _build(turns: int):
-            # Fresh rng per attempt so the drawn history length (and focal completion-turn
-            # skip) stays a pure function of (seed, sample_id, turns) -- i.e. identical on
-            # every rank, never dependent on how many attempts happened to run.
+            # Fresh rng per attempt so the drawn history length stays a pure function of
+            # (seed, sample_id, turns) -- i.e. identical on every rank, never dependent on
+            # how many attempts happened to run.
             return build_messages(
                 conversations=sample["conversations"],
                 image_bytes_list=sample.get("image_bytes", []),
                 max_turns=turns,
                 rng=random.Random(f"{seed}-{sample_id}"),
-                focal_gamma=focal_gamma,
             )
 
         prompt, completion, images = _build(max_turns)
@@ -893,24 +697,17 @@ def _fast_encoded_length(
     images: List["Image.Image"],
 ) -> int:
     """Compute the exact token count `processor(text=[rendered], images=images)` would
-    produce, WITHOUT paying for the actual (expensive) pixel resize/rescale/normalize/
-    patchify work images go through -- only their (height, width) is needed.
+    produce, without paying for the actual (expensive) pixel resize/rescale/normalize/
+    patchify work -- only each image's (height, width) is needed.
 
-    Relies on `Qwen2VLProcessor`/`Qwen3VLProcessor`'s own public
-    `_get_num_multimodal_tokens(image_sizes=...)` (pure arithmetic on image dimensions
-    + the vision config's patch_size/merge_size/min_pixels/max_pixels -- see
-    `Qwen2VLImageProcessor.get_number_of_image_patches`/`smart_resize`) for the number
-    of vision tokens each image expands to, and combines that with a plain-text
-    tokenization of `rendered` (which -- pre-expansion -- contains exactly one literal
-    image-placeholder token per image, per both models' chat templates:
-    `<|vision_start|><|image_pad|><|vision_end|>`) to reconstruct the post-expansion
-    total length: `base_len - num_images + sum(num_image_tokens_per_image)`.
-
-    Verified byte-exact against the real `processor(...)` output across both Qwen2-VL
-    and Qwen3.5, for 1-5 images and image sizes spanning 1x1 to 7000x50 pixels (see
-    dev-time validation script; not shipped as a unit test to keep this file
-    dependency-light). Raises if `processor` doesn't support
-    `_get_num_multimodal_tokens` (caller falls back to the exact-but-slow path below).
+    Uses `Qwen2VLProcessor`/`Qwen3VLProcessor`'s own `_get_num_multimodal_tokens(...)`
+    (pure arithmetic on image size + patch_size/merge_size/min_pixels/max_pixels) for
+    each image's vision-token count, combined with a plain-text tokenization of
+    `rendered` (pre-expansion, one placeholder token per image) to reconstruct the
+    post-expansion length: `base_len - num_images + sum(num_image_tokens_per_image)`.
+    Verified byte-exact against real `processor(...)` output for 1-5 images across a
+    range of sizes. Raises if `processor` lacks `_get_num_multimodal_tokens` (caller
+    falls back to the exact-but-slow path).
     """
     raw_ids = processor.tokenizer(rendered, add_special_tokens=False)["input_ids"]
     base_len = len(raw_ids)
@@ -930,30 +727,19 @@ def _exceeds_max_length(
     chat_template_kwargs: Optional[Dict] = None,
 ) -> bool:
     """Compute `prompt+completion+images`'s token count under the REAL processor/
-    chat-template about to be used for training, and check whether it overflows
-    `max_seq_length`.
+    chat-template about to be used, and check whether it overflows `max_seq_length`.
 
-    This exists purely to pre-filter samples that would otherwise crash training (see
-    `_row_to_trl_sample`'s docstring): unlike plain-text overflow (which the collator
-    truncates away harmlessly), an overflowing VLM sample risks the truncation point
-    landing inside an image's placeholder-token block, which crashes the model's
-    forward pass with a tokens/features-count mismatch instead of just losing some
-    trailing context. We therefore treat ANY overflow on an image-bearing sample as
-    unsafe and drop it, rather than trying to reason about whether this particular
-    truncation point happens to fall after the last image (safe) or through one
-    (crash) -- the dropped fraction is small and this is far cheaper than debugging a
-    mid-run multi-GPU crash.
+    Pre-filters samples that would otherwise crash training mid-run: an overflowing
+    VLM sample risks the truncation point landing inside an image's placeholder-token
+    block, which crashes the forward pass with a tokens/features mismatch (unlike
+    plain-text overflow, which the collator truncates away harmlessly). Any overflow on
+    an image-bearing sample is therefore treated as unsafe and dropped.
 
-    Tries the cheap `_fast_encoded_length` path first (see its docstring -- avoids
-    redoing the SAME expensive image resize/rescale/normalize/patchify work the
-    collator is about to do for real on every image-bearing sample a SECOND time,
-    which was silently doubling image-preprocessing CPU cost per sample and capping
-    GPU utilization around 30% even after fixing the S3-read bottleneck separately).
-    Falls back to the exact-but-slower full `processor(...)` call if the fast path
-    raises (e.g. a future/different model class without `_get_num_multimodal_tokens`).
-
-    On any error from BOTH paths (e.g. a malformed/corrupt image), returns True (drop
-    defensively) rather than propagating the exception out of a `.map()` call.
+    Tries the cheap `_fast_encoded_length` path first (avoids redoing the same
+    expensive image preprocessing the collator is about to do for real -- this was
+    silently capping GPU utilization around 30%), falling back to the exact
+    `processor(...)` call if that raises. Any error from both paths drops the sample
+    defensively rather than propagating out of a `.map()` call.
     """
     try:
         rendered = processor.apply_chat_template(
@@ -1017,28 +803,18 @@ _USED_COLUMNS = {"id", "conversations", "image"}
 
 def _load_dataset_multi(builder_name: str, data_path: Union[str, List[str]], streaming: bool):
     """`load_dataset(builder_name, data_files=data_path, split="train", streaming=...)`,
-    except when `data_path` is a `list` of several files: those are loaded and reduced
-    to `_USED_COLUMNS` ONE FILE AT A TIME, then stitched together with
-    `concatenate_datasets`, instead of a single `load_dataset(..., data_files=[...])`
-    call across every file at once.
+    except when `data_path` is a `list`: those files are loaded and trimmed to
+    `_USED_COLUMNS` ONE AT A TIME then stitched with `concatenate_datasets`, instead of
+    a single `load_dataset(..., data_files=[...])` call.
 
-    This matters because `minecraft-vlp`'s jsonl files (needed combined for JARVIS-VLA
-    Stage II: VQA + Caption + 3 Grounding files) have wildly different schemas for
-    columns training never uses -- e.g. `source` is `{"image_url": str, "points":
-    [x,y], ...}` in one file, `{"image_urls": [str, ...], "points": [[x,y], ...],
-    "action": str, ...}` in another, and `{"image_url": [str], "points": [{"x":,"y":},
-    ...], "bbox": [{"label":, "bbox": [[[...]]]}]}` in a third; one file even has a
-    typo'd `datatime` key instead of `datetime`. A single combined `load_dataset(...,
-    data_files=[f1, f2, ...])` call makes the streaming JSON reader try to unify ALL
-    files' schemas into one global Arrow schema up front (via HF `datasets`'
-    `_cast_table`/`table_cast`) -- verified this hard-crashes with `TypeError: Couldn't
-    cast array of type struct<...> to struct<...>` as soon as iteration reaches a file
-    whose `source` struct-shape disagrees with the one inferred from an earlier file.
-    Since pyarrow's per-file JSON schema inference never sees more than one file when
-    each is loaded (and trimmed) separately, this side-steps the incompatibility
-    entirely -- verified against the real 5-file Stage II combination (261,461 rows
-    iterated end-to-end with no error, vs. an immediate crash with the naive combined
-    call).
+    Needed because `minecraft-vlp`'s jsonl files (combined for JARVIS-VLA Stage II)
+    have wildly different schemas for columns training never uses (e.g. `source`'s
+    struct shape differs per file, one file even has a typo'd `datatime` key). A single
+    combined `load_dataset` call tries to unify ALL files into one Arrow schema up
+    front and hard-crashes (`TypeError: Couldn't cast array...`) the moment it hits a
+    disagreeing file; loading each file separately never exposes pyarrow to more than
+    one schema at a time, sidestepping this entirely (verified against the real 5-file
+    Stage II combination).
     """
     if not isinstance(data_path, list):
         return load_dataset(builder_name, data_files=data_path, split="train", streaming=streaming)
@@ -1063,78 +839,46 @@ def build_minecraft_dataset(
     text_only: bool = False,
     processor=None,
     max_seq_length: Optional[int] = None,
-    focal_gamma: Optional[float] = None,
     full_trajectory: bool = False,
 ):
     """
     Build the Minecraft SFT dataset as a genuine `datasets.Dataset` (`streaming=False`)
-    or `datasets.IterableDataset` (`streaming=True`) of TRL prompt-completion samples:
-        {"prompt": [...], "completion": [...], "images": [PIL.Image, ...]}
-    (see `build_messages`/`build_messages_qa` for why prompt/completion instead of a
-    flat `messages` list -- it's what lets `SFTConfig(completion_only_loss=True)` mask
-    context/history out of the loss for VLM training).
+    or `datasets.IterableDataset` (`streaming=True`). Samples are either
+    `{"prompt": [...], "completion": [...], "images": [...]}` (default -- lets
+    `SFTConfig(completion_only_loss=True)` mask context out of the loss) or, with
+    `full_trajectory=True`, `{"messages": [...], "images": [...]}` for
+    `_MultiStepVLMCollator`'s per-step masking instead.
 
     Supports two on-disk layouts, auto-detected from `data_path`'s extension (override
-    with `data_format="parquet"` or `data_format="jsonl"`):
+    with `data_format=`):
       - "parquet" (e.g. `minecraft-text-action-dataset`): each row is one trajectory
-        with a `conversations` list plus an `image_bytes` list (one raw-JPEG-bytes
-        entry per (user, assistant) turn pair); `build_messages` randomly samples a
-        suffix history window (`max_turns`) from it. Images are decoded from the
-        already-embedded bytes.
-      - "jsonl" (e.g. `minecraft-vlp`): each row is a short, independent multi-turn Q&A
-        session with an `image` field listing path(s) *relative to `image_root`*
-        (default: the directory containing the jsonl file(s), which matches
-        `minecraft-vlp`'s layout of `<root>/*.jsonl` + `<root>/images/...`);
-        `build_messages_qa` loads those bytes on-the-fly via `fsspec` (works for both
-        local paths and `s3://` URIs, the latter via the `s3fs` dependency) and keeps
-        the whole conversation (no history sampling -- these rows are already short).
+        (`conversations` + one `image_bytes` entry per turn pair). `build_messages`
+        randomly samples a suffix history window (`max_turns`), or (with
+        `full_trajectory=True`) `_build_full_trajectory` keeps the whole thing.
+      - "jsonl" (e.g. `minecraft-vlp`): each row is a short, independent Q&A session
+        with an `image` field listing path(s) relative to `image_root` (default: the
+        directory containing the jsonl file). `build_messages_qa` loads those on-the-fly
+        via `fsspec` and keeps the whole (already-short) conversation.
 
-    `text_only=True` (Stage I): for pure-text rows with no images at all -- e.g.
-    `minecraft-vlp/mc-qa-*.jsonl`'s `label=["qa","wiki","self-instruct"]` rows, a
-    `system` + `user` + `assistant` text QA turn with `image=[]` -- routes every row
-    through `build_messages_text_only` instead of `build_messages`/`build_messages_qa`,
-    and the resulting samples carry NO "images" key at all (see `_row_to_trl_sample`).
-    This is what JARVIS-VLA calls Stage I ("Minecraft world knowledge" text-only
-    post-training); combine with `freeze_vision_tower(model)` beforehand to also match
-    the paper's "ViT + adapter frozen, only LLM trained" recipe for this stage. Using
-    `text_only=True` together with `data_format="parquet"` is unusual (parquet rows are
-    trajectories with real images) and logs a warning, but works: any `image_bytes` on
-    those rows is simply ignored.
+    `text_only=True` (Stage I, no images): routes every row through
+    `build_messages_text_only` instead, and the resulting samples carry NO "images" key
+    at all -- `SFTTrainer` picks its vision collator purely based on whether that key
+    is *present*. Combine with `freeze_vision_tower(model)` to match JARVIS-VLA's Stage
+    I recipe (ViT+adapter frozen, only LLM trained).
 
-    IMPORTANT: this returns the result of chaining `.map()` / `.filter()` /
-    `.remove_columns()` directly on `datasets.load_dataset(...)`'s return value -- NOT a
-    hand-rolled `torch.utils.data.IterableDataset` subclass. `trl.SFTTrainer` requires
-    `train_dataset` to be a     `datasets.Dataset` / `datasets.IterableDataset` instance (it
-    raises `TypeError` otherwise at trainer-construction time, even though a custom torch
-    `IterableDataset` would iterate correctly on its own -- this bug is what this function
-    replaces). Chaining `.map()`/`.filter()` on the loaded dataset keeps the returned
-    object a real `datasets`-library type while preserving all sharding behavior:
-      - This function deliberately returns the FULL, UNSHARDED dataset. SFTTrainer sets
-        `dispatch_batches=False` for a HF IterableDataset, and Trainer subsequently calls
-        `Accelerator.prepare(DataLoader)`, where Accelerate performs the one and only
-        process-level shard (`dataset.shard(...)` or `IterableDatasetShard`). Do NOT call
-        `split_dataset_by_node` here: doing so divides each process stream by world_size a
-        second time, causing deterministic early exhaustion and mismatched collectives.
-      - Cross-worker sharding (when `dataloader_num_workers > 0`) needs no extra code:
-        `.map()`/`.filter()` on an `IterableDataset` just wrap the underlying shard
-        iterator rather than replacing it with a single unshardable generator, so
-        `datasets.IterableDataset.__iter__`'s own `get_worker_info()`-based splitting
-        still kicks in automatically inside each DataLoader worker process.
+    IMPORTANT: returns the result of chaining `.map()`/`.filter()`/`.remove_columns()`
+    directly on `datasets.load_dataset(...)`'s return value -- NOT a hand-rolled
+    `torch.utils.data.IterableDataset` (which `SFTTrainer` rejects with `TypeError` at
+    construction time). The dataset is deliberately returned FULL and UNSHARDED:
+    SFTTrainer/Accelerate performs the one and only process-level shard while preparing
+    the DataLoader; calling `split_dataset_by_node` here would divide each stream by
+    world_size a second time (deterministic early exhaustion + mismatched collectives).
 
-    When `streaming=False`, the underlying HF dataset is fully materialized and
-    random-access (`__getitem__`/`__len__`) is supported as usual for `datasets.Dataset`;
-    when `streaming=True` (the default for large S3 datasets), only iteration is
-    supported -- `len()` is undefined, matching `datasets.IterableDataset` semantics.
-
-    `processor`/`max_seq_length`: when both are given, image-bearing samples whose REAL
-    tokenized length (computed with this exact `processor`) would overflow
-    `max_seq_length` are dropped instead of silently truncated -- see
-    `_row_to_trl_sample`/`_exceeds_max_length` for why blind token-level truncation is
-    unsafe for VLM samples (it can crash training by cutting through an image's
-    placeholder-token block). Pass the same `AutoProcessor` instance used to build
-    `training_args`/the model so the token counts match exactly. Omit both (the
-    default) to skip this check entirely -- e.g. for Stage I `--text_only` data, which
-    has no images and thus no risk of this specific crash.
+    `processor`/`max_seq_length`: when both given, image-bearing samples whose REAL
+    tokenized length would overflow `max_seq_length` are dropped instead of silently
+    truncated (see `_exceeds_max_length` for why blind truncation crashes VLM training).
+    Pass the same `AutoProcessor` used for the model. Omit both to skip this check
+    (e.g. for `--text_only` data, which has no images and thus no risk of this crash).
     """
     if data_format == "auto":
         data_format = _detect_data_format(data_path)
@@ -1176,7 +920,6 @@ def build_minecraft_dataset(
             "text_only": text_only,
             "processor": processor,
             "max_seq_length": max_seq_length,
-            "focal_gamma": focal_gamma,
             "full_trajectory": full_trajectory,
         },
         remove_columns=raw_columns,
@@ -1188,35 +931,25 @@ def build_minecraft_dataset(
 
 # ─── model helpers ─────────────────────────────────────────────────────────────
 
-# Substrings matched (case-insensitively) against each submodule's own leaf name (not
-# its full dotted path) to find the vision tower. For the Qwen2-VL / Qwen2.5-VL /
-# Qwen3-VL / Qwen3.5-VL family the ViT + patch-merger both live under a single
-# submodule literally named "visual" (e.g. `model.visual`, containing `patch_embed`,
-# `blocks`, AND `merger`) -- so freezing that one submodule already freezes the
-# encoder and the vision-to-text adapter together, matching JARVIS-VLA's Stage I
-# recipe of "ViT + adapter frozen, only the LLM backbone trained". The other hints are
-# fallbacks for other VLM architectures that split the encoder/adapter differently.
+# Substrings matched (case-insensitively) against each submodule's own leaf name to
+# find the vision tower. For Qwen2-VL/Qwen2.5-VL/Qwen3-VL/Qwen3.5-VL, ViT + adapter
+# both live under one submodule named "visual", so freezing it matches JARVIS-VLA's
+# Stage I recipe ("ViT + adapter frozen, only LLM trained"). Other hints are fallbacks
+# for architectures that split encoder/adapter differently.
 _VISION_SUBMODULE_HINTS = ("visual", "vision_tower", "vision_model", "image_encoder")
 
 
 def freeze_vision_tower(model: torch.nn.Module) -> None:
     """
-    Freeze the vision encoder (+ its adapter/merger into the LLM's embedding space),
-    leaving only the language-model backbone trainable. This is JARVIS-VLA's Stage I
-    ("Minecraft world knowledge" text-only post-training) recipe: only the LLM is
-    updated while the vision tower stays frozen; Stage II then unfreezes everything
-    again once real image data (VQA/captioning/grounding) is introduced -- so this
-    should only be called for the Stage I / `--text_only` run, not Stage II.
+    Freeze the vision encoder + adapter, leaving only the LLM backbone trainable --
+    JARVIS-VLA's Stage I recipe (Stage II unfreezes everything again once real image
+    data is introduced, so only call this for `--text_only` runs).
 
-    Walks `model.named_modules()` looking for a submodule whose *own* name (not its
-    full dotted path) matches one of `_VISION_SUBMODULE_HINTS`, and sets
-    `requires_grad_(False)` on every parameter under it. Only the outermost matching
-    submodule per branch is frozen (a submodule nested inside an already-frozen one is
-    skipped) to avoid redundant work and confusing double-counting in the log message.
-
-    Raises `RuntimeError` if no matching submodule is found at all -- silently no-op'ing
-    here would be far worse than crashing, since it would look like Stage I is running
-    correctly while actually training the full model (vision tower included).
+    Walks `model.named_modules()` for a submodule whose own name matches
+    `_VISION_SUBMODULE_HINTS` and freezes every parameter under it (skipping submodules
+    already nested inside a frozen one). Raises `RuntimeError` if nothing matches --
+    silently no-op'ing would look like Stage I ran correctly while actually training
+    the full model.
     """
     frozen_modules: List[str] = []
     frozen_params = 0
@@ -1276,149 +1009,6 @@ def _clone_conversation(messages):
     return cloned_messages
 
 
-class _VeOmniAlignedVisionCollator:
-    """Vision-language collator that reproduces OpenHA's official Stage-III recipe.
-
-    TRL's own VLM collator (`DataCollatorForVisionLanguageModeling`) cannot express
-    "compute loss on EVERY assistant turn of a multi-turn trajectory": its
-    language-modeling path only masks padding (`labels = input_ids.clone()`), and the
-    `assistant_only_loss` mechanism is hard-rejected for vision datasets at
-    `SFTTrainer.__init__` time. This collator closes that gap by reimplementing, on the
-    collator path, exactly what VeOmni's `Qwen2VLChatTemplate` /
-    `Qwen2_5VLFocalChatTemplate.encode_messages` do:
-
-      * every message is tokenized INDIVIDUALLY as
-        `<|im_start|>{role}\n{content}<|im_end|>\n` (so each message's token boundary is
-        exact -- no reliance on `apply_chat_template`'s `return_assistant_tokens_mask`,
-        which we verified returns all-zeros for vision inputs);
-      * `{"type": "image"}` placeholders are rendered as
-        `<|vision_start|><|image_pad|>*N<|vision_end|>` with N = t*h*w from the
-        image processor's `image_grid_thw` (exact vision-token count);
-      * labels keep the token ids for `assistant` turns and set `IGNORE_INDEX` for
-        every other turn (system/user/image/padding) -- i.e. multi-step loss on every
-        "Action: ..." turn of the trajectory;
-      * focal repeated-action suppression: consecutive IDENTICAL assistant actions have
-        their loss-mask kept with probability `focal_gamma**k` (k = position inside the
-        run), starting from `focal_alpha=1.0` and multiplying by `focal_gamma` on each
-        repeat -- the exact `0.75**k` geometric schedule VeOmni uses.
-
-    No `system` message is emitted (matching VeOmni, whose `_get_system_mesage()` call
-    is commented out): the dataset's system prompt already lives inside the first user
-    turn's text, so the token stream is byte-compatible with VeOmni's training-time
-    layout.
-
-    Input example shape (from `build_full_trajectory`):
-        {"messages": [{"role", "content": [{"type": "text"/"image"}]}], "images": [PIL]}
-    """
-
-    def __init__(self, processor, max_length: Optional[int] = None, focal_gamma: Optional[float] = None):
-        self.processor = processor
-        self.tokenizer = processor.tokenizer
-        self.image_processor = processor.image_processor
-        self.max_length = max_length
-        self.focal_gamma = focal_gamma if (focal_gamma is not None and 0.0 < focal_gamma < 1.0) else None
-        self.pad_token_id = self.tokenizer.pad_token_id
-        self._image_pad = "<|image_pad|>"
-
-    def _image_pattern(self, token_num: int) -> str:
-        return "<|vision_start|>" + self._image_pad * token_num + "<|vision_end|>"
-
-    def _encode_one(self, messages: List[Dict], image_token_nums: List[int]) -> Tuple[List[int], List[int]]:
-        """Tokenize one full trajectory message-by-message, returning (input_ids, labels)."""
-        input_ids: List[int] = []
-        labels: List[int] = []
-        image_index = 0
-        last_assistant_content = ""
-        focal_alpha = 1.0
-
-        for message in messages:
-            role = message["role"]
-            content = ""
-            for item in message.get("content", []):
-                if item.get("type") == "text":
-                    content += item.get("text", "")
-                elif item.get("type") == "image":
-                    content += self._image_pattern(image_token_nums[image_index])
-                    image_index += 1
-
-            loss_mask = 1 if role == "assistant" else 0
-            if role == "assistant" and self.focal_gamma is not None:
-                if last_assistant_content == content:
-                    focal_alpha *= self.focal_gamma
-                    if random.random() > focal_alpha:
-                        loss_mask = 0  # suppress this repeated action (VeOmni loss_mask=0)
-                else:
-                    focal_alpha = 1.0
-                last_assistant_content = content
-
-            if content == "":
-                content_str = "<|im_start|>" + role + "\n"
-            else:
-                content_str = "<|im_start|>" + role + "\n" + content.strip() + "<|im_end|>\n"
-
-            content_ids = self.tokenizer.encode(content_str, add_special_tokens=False)
-            input_ids += content_ids
-            if loss_mask == 1:
-                labels += content_ids
-            else:
-                labels += [IGNORE_INDEX] * len(content_ids)
-
-        return input_ids, labels
-
-    def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
-        # 1. Batch the images ONCE through the image processor (all samples' images
-        #    concatenated), then split the per-image token counts back per sample.
-        all_images: List[Image.Image] = []
-        sample_image_counts: List[int] = []
-        for ex in examples:
-            imgs = ex.get("images") or []
-            sample_image_counts.append(len(imgs))
-            all_images.extend(imgs)
-
-        pixel_values = None
-        image_grid_thw = None
-        token_nums: List[int] = []
-        if all_images:
-            ip_out = self.image_processor(all_images, return_tensors=None)
-            pixel_values = ip_out["pixel_values"]  # [total_patches, patch_dim]
-            image_grid_thw = ip_out["image_grid_thw"]  # [total_images, 3]
-            token_nums = [int(t * h * w) for t, h, w in image_grid_thw.tolist()]
-
-        # 2. Encode each sample message-by-message (VeOmni-style multi-step labels).
-        batch_input_ids: List[List[int]] = []
-        batch_labels: List[List[int]] = []
-        offset = 0
-        for ex, n_img in zip(examples, sample_image_counts):
-            sample_token_nums = token_nums[offset:offset + n_img]
-            offset += n_img
-            input_ids, labels = self._encode_one(ex["messages"], sample_token_nums)
-            if self.max_length is not None:
-                input_ids = input_ids[: self.max_length]
-                labels = labels[: self.max_length]
-            batch_input_ids.append(input_ids)
-            batch_labels.append(labels)
-
-        # 3. Pad to the batch max length.
-        max_len = max((len(ids) for ids in batch_input_ids), default=0)
-        pad_id = self.pad_token_id
-        padded_ids, padded_labels, padded_mask = [], [], []
-        for ids, lbls in zip(batch_input_ids, batch_labels):
-            pad_len = max_len - len(ids)
-            padded_ids.append(ids + [pad_id] * pad_len)
-            padded_labels.append(lbls + [IGNORE_INDEX] * pad_len)
-            padded_mask.append([1] * len(ids) + [0] * pad_len)
-
-        batch = {
-            "input_ids": torch.tensor(padded_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(padded_mask, dtype=torch.long),
-            "labels": torch.tensor(padded_labels, dtype=torch.long),
-        }
-        if pixel_values is not None:
-            batch["pixel_values"] = pixel_values
-            batch["image_grid_thw"] = image_grid_thw
-        return batch
-
-
 class _ImmutableVisionCollatorAdapter:
     """Give TRL's mutating VLM collator disposable sample containers.
 
@@ -1446,29 +1036,52 @@ class _ImmutableVisionCollatorAdapter:
         return self.inner_collator(working_examples)
 
 
+class _MultiStepVLMCollator(DataCollatorForVisionLanguageModeling):
+    """TRL's VLM collator, but only assistant turns contribute to the loss.
+
+    The parent already injects images, renders the chat template, expands image tokens
+    and pads; its `_collate_language_modeling` sets `labels = input_ids` (loss on every
+    token except padding). We only override that labels step: assistant turns are
+    delimited by `<|im_start|>assistant` ... `<|im_end|>`, so every token outside those
+    spans (system/user/image/padding) is masked to -100. This reproduces JARVIS-VLA
+    Stage III, where every "Action: ..." turn is a training target.
+    """
+
+    def _collate_language_modeling(self, examples):
+        output = super()._collate_language_modeling(examples)
+        tok = self.processor.tokenizer
+        im_start = tok.convert_tokens_to_ids("<|im_start|>")
+        im_end = tok.convert_tokens_to_ids("<|im_end|>")
+        assistant_id = tok.convert_tokens_to_ids("assistant")
+        labels = output["input_ids"].clone()
+        for b, row in enumerate(output["input_ids"].tolist()):
+            in_assistant = False
+            for t, tok_id in enumerate(row):
+                if tok_id == im_start and t + 1 < len(row) and row[t + 1] == assistant_id:
+                    in_assistant = True
+                if not in_assistant:
+                    labels[b, t] = -100
+                if tok_id == im_end:
+                    in_assistant = False
+        labels[output["attention_mask"] == 0] = -100
+        output["labels"] = labels
+        return output
+
+
 # ─── debug / dry-run helpers ──────────────────────────────────────────────────
 
 
 def debug_dry_run(args):
     """
     Quick END-TO-END smoke test against a real GPU, using the exact same code path as
-    real training:
-      1. Download the model, load processor + model.
-      2. Build the REAL training dataset via `build_minecraft_dataset` (same function
-         `main()` calls) -- this is what actually catches `train_dataset`
-         type/format incompatibilities with `SFTTrainer` (e.g. a hand-rolled
-         `torch.utils.data.IterableDataset` raises `TypeError` at trainer-construction
-         time; a manual `processor(...)`/collator-only test would never hit that code
-         path at all).
-      3. Construct a real `SFTTrainer` with a bounded `SFTConfig` (controlled by
-         `--debug_steps`, no checkpoint saving, no external logging) and call `.train()`.
-         This exercises dataset iteration, the vision-language collator, forward,
-         backward, and an optimizer step through the same trainer code real training uses.
+    real training: download model, build the REAL dataset via `build_minecraft_dataset`
+    (catches `train_dataset` type/format issues a collator-only test would miss),
+    construct a real `SFTTrainer` bounded by `--debug_steps` (no checkpoint/logging),
+    then `.train()`.
 
-    This helper is normally launched as a single Python process, so it does NOT validate
-    multi-process sharding by itself. Distributed sharding must be checked under torchrun;
-    in production the unsharded HF IterableDataset returned above is split exactly once by
-    SFTTrainer/Accelerate during DataLoader preparation.
+    Runs as a single process, so it does NOT validate multi-process sharding -- that
+    must be checked under torchrun (SFTTrainer/Accelerate shards the dataset exactly
+    once while preparing the DataLoader).
     """
     logger.info("=== DEBUG DRY RUN ===")
     logger.info(f"Model: {args.model_path}")
@@ -1503,7 +1116,6 @@ def debug_dry_run(args):
         text_only=args.text_only,
         processor=processor,
         max_seq_length=args.max_seq_length,
-        focal_gamma=args.focal_gamma,
         full_trajectory=args.full_trajectory,
     )
 
@@ -1529,9 +1141,9 @@ def debug_dry_run(args):
         deepspeed=args.deepspeed,
         remove_unused_columns=False,
         packing=False,
-        # full_trajectory mode computes multi-step labels in `_VeOmniAlignedVisionCollator`
-        # (which needs NO TRL-side loss masking); the default prompt/completion path needs
-        # completion_only_loss=True to mask the prompt/context out of the loss.
+        # prompt/completion path masks the context out of the loss (only the target
+        # "Action: ..." completion is trained on). --full_trajectory instead builds the
+        # labels inside `_MultiStepVLMCollator`, so TRL's own masking must be OFF.
         completion_only_loss=not args.full_trajectory,
         seed=args.seed,
         report_to=["none"],
@@ -1546,11 +1158,7 @@ def debug_dry_run(args):
         processing_class=processor,
     )
     if args.full_trajectory:
-        trainer.data_collator = _VeOmniAlignedVisionCollator(
-            processor=processor,
-            max_length=args.max_seq_length,
-            focal_gamma=args.focal_gamma,
-        )
+        trainer.data_collator = _MultiStepVLMCollator(processor=processor, max_length=args.max_seq_length)
     else:
         trainer.data_collator = _ImmutableVisionCollatorAdapter(trainer.data_collator)
     logger.info(f"Running trainer.train() for max_steps={args.debug_steps} with immutable VLM collator inputs...")
@@ -1671,29 +1279,12 @@ def main():
     )
     parser.add_argument("--max_turns", type=int, default=4, help="Max (user,assistant) pairs per sample")
     parser.add_argument(
-        "--focal_gamma",
-        type=float,
-        default=0.75,
-        help="Focal repeated-action suppression rate for Stage III (OpenHA "
-        "Qwen2_5VLFocalChatTemplate's focal_alpha). Consecutive identical assistant "
-        "actions are skipped with keep-probability focal_gamma^k so long runs of a "
-        "'safe' repeated action (e.g. move(0,0) while walking straight) cannot dominate "
-        "the loss and collapse the model into always predicting that mode. 0.75 "
-        "replicates the official recipe; pass 1.0 (or 0) to disable. In "
-        "--full_trajectory mode this is applied inside the collator as a per-step "
-        "loss-mask (exactly like VeOmni); otherwise it selects the completion turn at "
-        "sampling time. Only affects the parquet/trajectory path, not text_only/jsonl.",
-    )
-    parser.add_argument(
         "--full_trajectory",
         action="store_true",
-        default=False,
-        help="VeOmni-aligned Stage-III mode: keep the ENTIRE trajectory (system prompt + "
-        "instruction + every (image, action) step, no random history window) and compute "
-        "loss on EVERY assistant turn via _VeOmniAlignedVisionCollator (multi-step loss + "
-        "per-step focal suppression), instead of the default prompt/completion "
-        "completion_only_loss path. Requires parquet trajectory data; use a large "
-        "--max_seq_length (e.g. 19456, matching VeOmni) since trajectories are long.",
+        help="Stage III multi-step loss: keep the WHOLE parquet trajectory (no random "
+        "history window) and train on EVERY assistant 'Action: ...' turn via "
+        "_MultiStepVLMCollator, instead of only the last turn. Requires --max_seq_length "
+        "large enough to hold a full trajectory (e.g. 19456).",
     )
     parser.add_argument("--max_seq_length", type=int, default=16384)
     parser.add_argument("--per_device_batch_size", type=int, default=2)
@@ -1742,18 +1333,10 @@ def main():
         "--dataloader_num_workers",
         type=int,
         default=4,
-        help=(
-            "Number of background `DataLoader` worker processes (per rank) used to "
-            "prefetch/preprocess samples (image decode/resize, tokenization) while the "
-            "GPU trains on the previous batch. With `--image_root` pointed at local "
-            "disk (see the training launch script's pre-download-to-/local-ssd step) "
-            "and `_exceeds_max_length`'s cheap size-only length pre-check (see its "
-            "docstring), the remaining per-sample CPU cost is dominated by the "
-            "collator's real image resize/rescale/normalize/patchify -- more workers "
-            "lets that run in parallel across CPU cores instead of serializing behind "
-            "GPU compute. Bump this further (e.g. 8) if GPU utilization is still low "
-            "after confirming images are being read from local disk, not S3."
-        ),
+        help="Background DataLoader worker processes (per rank) for prefetch/"
+        "preprocessing (image decode/resize, tokenization) while the GPU trains on the "
+        "previous batch. Bump this (e.g. 8) if GPU utilization is low after confirming "
+        "images are read from local disk, not S3.",
     )
     parser.add_argument("--deepspeed", type=str, default=None, help="Path to DeepSpeed config JSON")
     parser.add_argument("--seed", type=int, default=42)
@@ -1762,12 +1345,9 @@ def main():
         type=float,
         default=180.0,
         help="Diagnose hangs: if no training step completes within this many seconds, "
-        "dump every thread's Python traceback (plus the dataloader workers') to "
-        "stderr/job log. A multi-node hang otherwise only shows up as NCCL's "
-        "'Watchdog caught collective operation timeout ... 600000ms', which never "
-        "reveals which line each rank is stuck on. Keep this well below the NCCL "
-        "timeout so stacks are captured while the process is still alive. Set 0 to "
-        "disable (default: 180).",
+        "dump every thread's Python traceback to stderr/job log (NCCL's own watchdog "
+        "only reports a timeout, never which line each rank is stuck on). Keep below "
+        "the NCCL timeout (600s). Set 0 to disable.",
     )
     parser.add_argument(
         "--debug",
@@ -1782,7 +1362,14 @@ def main():
         help="Number of optimizer steps for --debug (default: 2).",
     )
     parser.add_argument("--download_model", type=str, default=None, help="Local dir to cache downloaded model")
-    parser.add_argument("--attn_implementation", type=str, default="flash_attention_2")
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="sdpa",
+        help="'sdpa' (default) needs no extra install and avoids a confirmed flash-attn "
+        "wheel/torch ABI mismatch on the koala training image (undefined symbol at "
+        "import time). Pass 'flash_attention_2' only after verifying a matching build.",
+    )
     # NOTE: TRL's SFTTrainer raises ValueError for packing=True on vision-language
     # models (all supported models here are VLMs), so packing defaults to False and
     # any attempt to force it on is rejected with a clear error instead of a crash
@@ -1861,7 +1448,6 @@ def main():
         # `text_only` samples have no images so this is a no-op for Stage I regardless.
         processor=processor,
         max_seq_length=args.max_seq_length,
-        focal_gamma=args.focal_gamma,
         full_trajectory=args.full_trajectory,
     )
 
@@ -1944,14 +1530,9 @@ def main():
         dataloader_num_workers=args.dataloader_num_workers,
         remove_unused_columns=False,
         packing=False,  # unsupported for VLMs, see argparse note above
-        # Loss masking strategy:
-        #   - default prompt/completion path: only the target "Action: ..." completion is
-        #     trained on (the VLM-supported equivalent of `assistant_only_loss`, which TRL
-        #     rejects for vision datasets) -- relies on `build_messages` splitting each
-        #     sample into {"prompt": ..., "completion": [last assistant turn]}.
-        #   - --full_trajectory (VeOmni-aligned): every assistant turn is trained on via
-        #     `_VeOmniAlignedVisionCollator`, which builds the labels itself -- so TRL's
-        #     completion_only_loss must be OFF to avoid double-masking.
+        # prompt/completion path masks the context out of the loss (only the target
+        # "Action: ..." completion is trained on). --full_trajectory instead builds the
+        # labels inside `_MultiStepVLMCollator`, so TRL's own masking must be OFF.
         completion_only_loss=not args.full_trajectory,
         seed=args.seed,
         report_to=["wandb"] if os.environ.get("WANDB_API_KEY") else ["none"],
@@ -1975,12 +1556,7 @@ def main():
         processing_class=processor,
     )
     if args.full_trajectory:
-        # VeOmni-aligned: multi-step assistant loss + focal, built by OUR collator.
-        trainer.data_collator = _VeOmniAlignedVisionCollator(
-            processor=processor,
-            max_length=args.max_seq_length,
-            focal_gamma=args.focal_gamma,
-        )
+        trainer.data_collator = _MultiStepVLMCollator(processor=processor, max_length=args.max_seq_length)
     elif not args.text_only:
         trainer.data_collator = _ImmutableVisionCollatorAdapter(trainer.data_collator)
     if args.stall_dump_seconds > 0:

@@ -1,32 +1,22 @@
 #!/bin/bash
 # ──────────────────────────────────────────────────────────────────────
-# TRL SFT training launch script for Minecraft VLM
+# TRL SFT training launch script for Minecraft VLM.
 #
-# Usage (single node, 8 GPUs):
-#   bash launch.sh --mode train --nproc 8
+# Usage:
+#   bash launch.sh debug                       # quick 1-GPU smoke test
+#   bash launch.sh train --nproc 8              # Stage I/II, single node
+#   bash launch.sh stage3 --nproc 8              # Stage III, full-trajectory multi-step loss
+#   NNODES=2 NODE_RANK=0 MASTER_ADDR=10.0.0.1 bash launch.sh train   # multi-node, node 0
 #
-# Usage (multi-node, 2 nodes × 8 GPUs):
-#   # Node 0:
-#   NNODES=2 NODE_RANK=0 MASTER_ADDR=10.0.0.1 bash launch.sh --mode train
-#   # Node 1:
-#   NNODES=2 NODE_RANK=1 MASTER_ADDR=10.0.0.1 bash launch.sh --mode train
-#
-# Debug mode (quick test):
-#   bash launch.sh --mode debug
-#
-# `train`/`debug` fully LOCALIZE the Stage II JSONL shards + referenced images to
-# `$LOCAL_DATA_ROOT` on local SSD BEFORE torchrun starts (see
-# `localize_stage2_jsonl_and_images` below). Root cause this avoids: with
-# `--data_path`/`--image_root` left as `s3://...`, every DataLoader worker on every
-# rank streams JSONL rows and reads images LIVE from S3 for the entire training run.
-# Confirmed in two real 16-GPU Stage II runs (2026-08-13): a stalled/slow live S3 read
-# on just ONE rank starves that rank's forward/backward step, which then blocks every
-# other rank's DeepSpeed `ALLREDUCE` (a collective op needs ALL ranks) until NCCL's
-# watchdog timeout fires and aborts the whole job -- in both runs the last per-rank log
-# line was an S3 credential lookup, followed by ~600s of total silence, then the
-# watchdog. Localizing ahead of time means training reads only the local filesystem
-# (no live S3 dependency, no per-step network variance) -- `--model_path` is separately
-# already downloaded once via `--download_model` before this happens.
+# Every mode self-bootstraps its Python env (see `bootstrap_env`) and localizes S3 data
+# to local disk BEFORE torchrun starts -- both were found, empirically, to be the two
+# most common causes of a training job dying: (a) the koala training image ships NO
+# torch/trl/deepspeed at all (only a bare `base` conda env), so `torchrun` is simply not
+# on PATH until an env is built; (b) leaving --data_path/--image_root as `s3://...`
+# makes every DataLoader worker on every rank stream rows/images LIVE from S3 for the
+# whole run -- one slow/stalled read on a single rank blocks that rank's step, which
+# then blocks every other rank's collective ops until NCCL's 600s watchdog aborts the
+# whole job (confirmed on two real 16-GPU Stage II runs).
 # ──────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -38,19 +28,24 @@ NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29400}"
+ATTN_IMPL="${ATTN_IMPL:-sdpa}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        train|debug) MODE="$1"; shift ;;
+        train|debug|stage3) MODE="$1"; shift ;;
         --mode) MODE="$2"; shift 2 ;;
         --nproc) NPROC="$2"; shift 2 ;;
         --nnodes) NNODES="$2"; shift 2 ;;
         --node-rank) NODE_RANK="$2"; shift 2 ;;
         --master-addr) MASTER_ADDR="$2"; shift 2 ;;
         --master-port) MASTER_PORT="$2"; shift 2 ;;
+        --attn-impl) ATTN_IMPL="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
 MODEL_PATH="${MODEL_PATH:-s3://arcwm-code-us-west-2/axiom/model/Qwen3.5-9B-stage1-8gpu-20260817}"
 DATA_PATH="${DATA_PATH:-s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp/mc-vqa-241102.jsonl,s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp/mc-caption-241104.jsonl,s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp/mc-grounding-point-embodied-image5.jsonl,s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp/mc-grounding-point-embodied.jsonl,s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp/mc-grounding-point-gui.jsonl}"
@@ -58,7 +53,7 @@ IMAGE_ROOT="${IMAGE_ROOT:-s3://arcwm-code-us-west-2/axiom/data/minecraft-vlp}"
 LOCAL_DATA_ROOT="${LOCAL_DATA_ROOT:-/local-ssd/minecraft-vlp}"
 LOCAL_PARQUET_ROOT="${LOCAL_PARQUET_ROOT:-/local-ssd/minecraft-text-action}"
 OUTPUT_DIR="${OUTPUT_DIR:-./stage2-qwen35-9b}"
-DOWNLOAD_CACHE="${DOWNLOAD_CACHE:-/tmp/qwen35_9b_stage1_cache}"
+DOWNLOAD_CACHE="${DOWNLOAD_CACHE:-/local-ssd/model_cache}"
 PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-2}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-4}"
 MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-16384}"
@@ -68,25 +63,39 @@ TOTAL_GPUS=$((NNODES * NPROC))
 MAX_STEPS="${MAX_STEPS:-$((STAGE2_TRAIN_SAMPLES / (PER_DEVICE_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * TOTAL_GPUS)))}"
 
 # W&B: sourced from a git-ignored local file (this repo is PUBLIC on GitHub -- never
-# commit a real key). Create trl_sft/.env.wandb with:
-#   export WANDB_API_KEY="your-key"
-#   export WANDB_PROJECT="minecraft-sft"
-#   export WANDB_RUN_NAME="trl-sft-v1"   # optional, defaults to "minecraft-sft-trl"
-# NOTE: this only helps for LOCAL runs of this script. For remote koala training jobs,
-# this file is NOT synced to S3 (same reason) -- export WANDB_API_KEY explicitly inside
-# the `koala submit -c "..."` command instead.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# commit a real key). Create trl_sft/.env.wandb with WANDB_API_KEY/WANDB_PROJECT/
+# WANDB_RUN_NAME. Only applies to LOCAL runs of this script; remote koala jobs must
+# export WANDB_API_KEY explicitly in the submit command instead.
 if [ -f "$SCRIPT_DIR/.env.wandb" ]; then
     # shellcheck disable=SC1091
     source "$SCRIPT_DIR/.env.wandb"
 fi
 
+# Make the training env ready to run `torchrun` (idempotent -- skips whatever's already
+# installed). The default koala training image ships NO torch/trl/deepspeed at all, and
+# has no `openha` (or similar) conda env baked in -- both confirmed by trial and error,
+# so this is the single source of truth going forward instead of re-discovering it via
+# failed jobs. requirements.txt has flash-attn commented out (see its own comment) --
+# --attn-impl sdpa (the default) does NOT need it installed at all.
+bootstrap_env() {
+    if ! command -v conda >/dev/null 2>&1; then
+        echo "[env] no conda found, assuming torch/trl/deepspeed are already on PATH." >&2
+        return
+    fi
+    # shellcheck disable=SC1091
+    source /opt/conda/etc/profile.d/conda.sh
+    conda env list | grep -q "^sft " || conda create -n sft python=3.10 -y -q
+    conda activate sft
+    python -c "import torch" 2>/dev/null || \
+        pip install -q torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+    python -c "import trl, transformers, deepspeed, datasets, accelerate" 2>/dev/null || \
+        pip install -q -r requirements.txt
+}
+
 # Pre-download every Stage II JSONL shard in `$DATA_PATH` plus every image
 # `$IMAGE_ROOT` points to onto local SSD, then REPOINT `$DATA_PATH`/`$IMAGE_ROOT` at the
-# local copies -- so torchrun never touches S3 again once training starts. Must run
-# independently on EACH node (local SSD is node-local, not shared). No-op if
-# `$DATA_PATH` is already local (e.g. a previous invocation on this same pod already
-# localized it, or the caller passed local paths directly).
+# local copies. Must run on EACH node (local SSD is node-local). No-op if `$DATA_PATH`
+# is already local.
 localize_stage2_jsonl_and_images() {
     if [[ "$DATA_PATH" != s3://* ]]; then
         echo "[localize] DATA_PATH is already local, skipping." >&2
@@ -121,27 +130,21 @@ localize_stage2_jsonl_and_images() {
     DATA_PATH="$(IFS=,; echo "${local_paths[*]}")"
     IMAGE_ROOT="$LOCAL_DATA_ROOT"
     echo "[localize] Done. DATA_PATH=$DATA_PATH IMAGE_ROOT=$IMAGE_ROOT" >&2
-    echo "[localize] Local image count: $(find "$LOCAL_DATA_ROOT" -type f ! -name '*.jsonl' | wc -l)" >&2
 }
 
-# Pre-download `minecraft-text-action-dataset`'s parquet shards (Stage III: action
-# post-training) onto local SSD, then repoint `$DATA_PATH` at the local glob -- same
-# rationale as `localize_stage2_jsonl_and_images` above (avoid every DataLoader worker
-# on every rank streaming parquet row-groups LIVE from S3 for the whole run). No
-# separate image sync is needed here: each parquet row already embeds its own
-# `image_bytes` column, unlike Stage II's jsonl+external-images layout. Must run
-# independently on EACH node (local SSD is node-local). No-op if `$DATA_PATH` is
-# already local. Expects `$DATA_PATH` to be a SINGLE glob (e.g.
-# "s3://.../minecraft-text-action-dataset/data/train-*.parquet"), not a
-# comma-separated list.
+# Pre-download `minecraft-text-action-dataset`'s parquet shards (Stage III) onto local
+# SSD, then repoint `$DATA_PATH` at the local glob -- same rationale as
+# `localize_stage2_jsonl_and_images` above. Each parquet row embeds its own
+# `image_bytes` column, so no separate image sync is needed. Expects `$DATA_PATH` to be
+# a SINGLE glob (e.g. "s3://.../data/train-*.parquet"), not a comma-separated list.
 localize_stage3_parquet_dataset() {
     if [[ "$DATA_PATH" != s3://* ]]; then
         echo "[localize] DATA_PATH is already local, skipping." >&2
         return
     fi
 
-    local s3_dir="${DATA_PATH%/*}/"       # e.g. "s3://.../data/train-*.parquet" -> "s3://.../data/"
-    local glob_name="$(basename "$DATA_PATH")"  # e.g. "train-*.parquet"
+    local s3_dir="${DATA_PATH%/*}/"
+    local glob_name="$(basename "$DATA_PATH")"
     mkdir -p "$LOCAL_PARQUET_ROOT"
     echo "[localize] Syncing parquet shards from $s3_dir to $LOCAL_PARQUET_ROOT ..." >&2
     if command -v s5cmd >/dev/null 2>&1; then
@@ -150,15 +153,18 @@ localize_stage3_parquet_dataset() {
         aws s3 sync "$s3_dir" "$LOCAL_PARQUET_ROOT/" --exclude "*" --include "*.parquet" --only-show-errors
     fi
 
+    # Quoted below at the call site -- an UNQUOTED glob here would be expanded by bash
+    # into hundreds of positional args before argparse ever sees it (confirmed root
+    # cause of a real launch failure: `--data_path` is a single str that does its own
+    # internal glob matching, not something the shell should expand for it).
     DATA_PATH="$LOCAL_PARQUET_ROOT/$glob_name"
     echo "[localize] Done. DATA_PATH=$DATA_PATH" >&2
-    # shellcheck disable=SC2086
-    echo "[localize] Local parquet shard count: $(ls -1 $LOCAL_PARQUET_ROOT/*.parquet 2>/dev/null | wc -l)" >&2
 }
 
 case "$MODE" in
     debug)
         echo "=== Running DEBUG dry-run ==="
+        bootstrap_env
         localize_stage2_jsonl_and_images
         python3 train_sft.py \
             --model_path "$MODEL_PATH" \
@@ -166,23 +172,18 @@ case "$MODE" in
             --data_format jsonl \
             --image_root "$IMAGE_ROOT" \
             --download_model "$DOWNLOAD_CACHE" \
+            --attn_implementation "$ATTN_IMPL" \
             --max_turns 2 \
             --debug
         ;;
     train)
-        echo "=== Multi-node training ==="
-        echo "NNODES=$NNODES NODE_RANK=$NODE_RANK NPROC=$NPROC"
-        echo "MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
-
+        echo "=== Stage I/II training: NNODES=$NNODES NODE_RANK=$NODE_RANK NPROC=$NPROC ==="
+        bootstrap_env
         localize_stage2_jsonl_and_images
-        echo "MODEL_PATH=$MODEL_PATH"
-        echo "OUTPUT_DIR=$OUTPUT_DIR MAX_STEPS=$MAX_STEPS TOTAL_GPUS=$TOTAL_GPUS"
+        echo "MODEL_PATH=$MODEL_PATH OUTPUT_DIR=$OUTPUT_DIR MAX_STEPS=$MAX_STEPS TOTAL_GPUS=$TOTAL_GPUS"
         torchrun \
-            --nnodes="$NNODES" \
-            --nproc_per_node="$NPROC" \
-            --node_rank="$NODE_RANK" \
-            --master_addr="$MASTER_ADDR" \
-            --master_port="$MASTER_PORT" \
+            --nnodes="$NNODES" --nproc_per_node="$NPROC" --node_rank="$NODE_RANK" \
+            --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
             train_sft.py \
                 --model_path "$MODEL_PATH" \
                 --data_path "$DATA_PATH" \
@@ -191,6 +192,7 @@ case "$MODE" in
                 --download_model "$DOWNLOAD_CACHE" \
                 --output_dir "$OUTPUT_DIR" \
                 --resume_from_checkpoint auto \
+                --attn_implementation "$ATTN_IMPL" \
                 --max_turns 4 \
                 --max_seq_length "$MAX_SEQ_LENGTH" \
                 --per_device_batch_size "$PER_DEVICE_BATCH_SIZE" \
@@ -204,8 +206,44 @@ case "$MODE" in
                 --save_steps 200 \
                 --logging_steps 10
         ;;
+    stage3)
+        : "${MODEL_PATH:?stage3 needs an explicit MODEL_PATH (a Stage II checkpoint)}"
+        MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-19456}"          # full trajectories need far more room than Stage I/II's 16384
+        PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-1}"
+        GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
+        DATA_PATH="${DATA_PATH_STAGE3:-s3://arcwm-code-us-west-2/axiom/data/minecraft-text-action-dataset/data/train-*.parquet}"
+        OUTPUT_DIR="${OUTPUT_DIR_STAGE3:-./stage3-output}"
+        MAX_STEPS="${MAX_STEPS_STAGE3:-3400}"
+        echo "=== Stage III training (full-trajectory multi-step loss): NPROC=$NPROC ==="
+        bootstrap_env
+        localize_stage3_parquet_dataset
+        echo "MODEL_PATH=$MODEL_PATH OUTPUT_DIR=$OUTPUT_DIR MAX_STEPS=$MAX_STEPS"
+        torchrun --nproc_per_node="$NPROC" --tee 3 train_sft.py \
+            --model_path "$MODEL_PATH" \
+            --data_path "$DATA_PATH" \
+            --data_format parquet \
+            --download_model "$DOWNLOAD_CACHE" \
+            --output_dir "$OUTPUT_DIR" \
+            --resume_from_checkpoint auto \
+            --full_trajectory \
+            --attn_implementation "$ATTN_IMPL" \
+            --max_seq_length "$MAX_SEQ_LENGTH" \
+            --per_device_batch_size "$PER_DEVICE_BATCH_SIZE" \
+            --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
+            --gradient_checkpointing \
+            --dataloader_num_workers "$DATALOADER_NUM_WORKERS" \
+            --num_train_epochs 1 \
+            --max_steps "$MAX_STEPS" \
+            --learning_rate 8e-6 \
+            --weight_decay 0.05 \
+            --warmup_ratio 0.03 \
+            --lr_scheduler_type cosine \
+            --deepspeed ds_zero2_no_offload.json \
+            --save_steps 200 \
+            --logging_steps 10
+        ;;
     *)
-        echo "Usage: bash launch.sh [debug|train]"
+        echo "Usage: bash launch.sh [debug|train|stage3]"
         exit 1
         ;;
 esac
