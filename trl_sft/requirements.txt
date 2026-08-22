@@ -15,39 +15,21 @@
 # reproducible; bump deliberately (and re-verify --debug) rather than letting `pip`
 # silently pick up new releases mid-experiment.
 #
-# `trl` is pinned to a GitHub commit, NOT the latest PyPI release (1.9.2 as of this
-# writing), because of a CONFIRMED, SEVERITY-CRITICAL bug in 1.9.2 when paired with
-# transformers==5.15.0: `SFTTrainer._prepare_dataset`'s prompt/completion tokenize path
-# calls `processing_class.apply_chat_template(example["prompt"], tokenize=True,
-# add_generation_prompt=True, ...)` (no `return_dict=True`) and then unwraps the result
-# via `prompt_ids[0] if isinstance(prompt_ids[0], list) else prompt_ids` -- a heuristic
-# written for an older convention where that call returned a plain `list[int]` (or
-# `list[list[int]]` for batched VLM calls). In transformers==5.15.0, that same call
-# instead returns a `BatchEncoding` (dict-like, keys "input_ids"/"attention_mask");
-# indexing `[0]` on it returns a `tokenizers.Encoding` object, not a `list`, so the
-# isinstance check fails and `prompt_ids` is left as the *unwrapped* `BatchEncoding`
-# itself. `len(prompt_ids)` then evaluates to 2 (the number of dict KEYS, not tokens),
-# so `completion_mask = [0]*len(prompt_ids) + [1]*(...)` masks out only the first 2
-# tokens of every single sample instead of the actual (much longer) prompt -- meaning
-# loss ends up computed over almost the ENTIRE sequence (system prompt + user question
-# included), not just the intended assistant completion. This exact chain was verified
-# directly against a real training sample + the real Qwen3.5-9B tokenizer (see chat
-# history for the full repro). It also explains the
-# "Mismatch between tokenized prompt and the start of tokenized prompt+completion"
-# warning logged on literally every sample: comparing 2 sliced ids against a whole
-# BatchEncoding object can never be equal, regardless of actual tokenizer behavior.
-# TRL's `main` branch has since refactored this into a `_tokenize()` helper
-# (`trl/data_utils.py`) that always passes `return_dict=True` and reads `["input_ids"]`
-# directly -- sidestepping the fragile shape-based heuristic entirely -- but as of this
-# writing that fix has not yet been included in any published PyPI release (`1.9.2` is
-# still latest and still has the bug). Pinning to this specific commit (rather than a
-# floating `@main`) keeps training runs reproducible; re-verify with --debug (checking
-# that no "Mismatch between tokenized prompt" warning appears) before bumping to a
-# future PyPI release that includes this fix, and switch back to a plain `trl==X.Y.Z`
-# pin once one is available.
+# `trl` is pinned to the stable PyPI release v1.10.0, which includes the
+# tokenization fix (the `_tokenize` helper in `trl/data_utils.py` that always
+# passes `return_dict=True`). This fix was previously only available on the
+# `main` branch (commit 24db2a8) and was not in any PyPI release at the time
+# of the original pinning; v1.10.0 (released 2026-08-13) is the first stable
+# release to include it.
+#
+# Note: v1.10.0's SFTTrainer._save_checkpoint() calls create_model_card() on
+# every --save_steps checkpoint. The model-card template contains non-ASCII
+# bytes, which can cause UnicodeDecodeError under a C (ASCII-only) locale.
+# This is handled by setting `export PYTHONUTF8=1` in the koala submit command
+# (infrastructure-level), not by patching library code.
 torch>=2.4.0
 transformers==5.15.0
-trl @ git+https://github.com/huggingface/trl.git@24db2a825029f7e0e60f6d3c160485565a784503
+trl==1.10.0
 # These exact versions are verified to let SFTTrainer/Accelerate perform the sole
 # process-level shard of a HF IterableDataset. Do not add a prior
 # split_dataset_by_node call in train_sft.py or each process will be sharded twice.
