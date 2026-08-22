@@ -66,6 +66,7 @@ import argparse
 import faulthandler
 import io
 import json
+import locale
 import logging
 import os
 import random
@@ -83,6 +84,19 @@ from transformers import AutoModelForImageTextToText, AutoProcessor, TrainerCall
 from trl import SFTConfig, SFTTrainer
 from trl.trainer.sft_trainer import DataCollatorForVisionLanguageModeling
 from PIL import Image
+
+# The koala/arcwm training image runs under the C locale, so Python's
+# locale.getpreferredencoding() returns 'ascii'. TRL's create_model_card() (called on
+# every --save_steps checkpoint) reads its model-card template via Path.read_text()
+# with the default encoding, which then crashes with
+#   UnicodeDecodeError: 'ascii' codec can't decode byte 0xc3 ...
+# on the template's non-ASCII bytes. Force a UTF-8 locale before anything reads a file.
+os.environ.setdefault("LANG", "C.UTF-8")
+os.environ.setdefault("LC_ALL", "C.UTF-8")
+try:
+    locale.setlocale(locale.LC_CTYPE, "C.UTF-8")
+except locale.Error:
+    pass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 

@@ -78,6 +78,11 @@ fi
 # failed jobs. requirements.txt has flash-attn commented out (see its own comment) --
 # --attn-impl sdpa (the default) does NOT need it installed at all.
 bootstrap_env() {
+    # The koala image runs under the C locale; TRL's create_model_card() (on every
+    # --save_steps checkpoint) reads its model-card template with Path.read_text()'s
+    # default encoding and crashes with UnicodeDecodeError under ascii. Export a UTF-8
+    # locale so Python starts in UTF-8 mode (train_sft.py also sets it defensively).
+    export LANG=C.UTF-8 LC_ALL=C.UTF-8
     if ! command -v conda >/dev/null 2>&1; then
         echo "[env] no conda found, assuming torch/trl/deepspeed are already on PATH." >&2
         return
